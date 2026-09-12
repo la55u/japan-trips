@@ -52,7 +52,7 @@ overwrite each other's price history:
 
 | | DB | Report | Committed to git |
 |---|---|---|---|
-| **CI (GitHub Actions, 12×/day)** | `flights.db` | `results.html` → GitHub Pages | yes |
+| **CI (GitHub Actions, hourly)** | `flights.db` | `results.html` → GitHub Pages | yes |
 | **Local runs (default)** | `flights_local.db` | `results_local.html` | no (gitignored) |
 
 Local runs never touch `flights.db`/`results.html`, and the CI workflow explicitly
@@ -98,9 +98,9 @@ Failed or empty queries are retried (3×, with backoff) and refetched on the nex
 
 ## Automation (GitHub Actions)
 
-The `.github/workflows/scan.yml` workflow runs every 2 hours (12×/day; GitHub may
-delay scheduled runs by some minutes). Each run fetches the next ~350 stale queries
-(`--limit 350 --db flights.db`, cache TTL 12 h), so the whole scan window is refreshed twice a day, so data is never staler than ~12 h — the rate per second stays unchanged,
+The `.github/workflows/scan.yml` workflow runs hourly (24×/day; GitHub may
+delay scheduled runs by some minutes). Each run fetches the next ~450 stale queries
+(`--limit 450 --db flights.db`, cache TTL 4 h), so the whole scan window is refreshed every ~4 h, so data is never staler than ~4 h — the per-second rate stays unchanged,
 roughly once a day while the page updates every 2 hours. After
 scanning, the workflow commits `results.html` and `flights.db` back to `main`, and
 GitHub Pages redeploys automatically. `flights.db` is committed so price history and
