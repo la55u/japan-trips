@@ -139,6 +139,24 @@ def _clock(pair):
     return (padded[0] or 0, padded[1] or 0)
 
 
+def _suggestions(payload):
+    out = []
+    try:
+        sec = payload[6][0][4][0]
+        for s in sec:
+            d1, d2, price_thing = s[0], s[1], s[2]
+            price = None
+            if isinstance(price_thing, list) and price_thing:
+                p = price_thing[0]
+                if isinstance(p, list) and len(p) > 1 and p[1] is not None:
+                    price = float(p[1])
+            if d1 and d2 and price:
+                out.append({"d1": d1, "d2": d2, "price": price})
+    except (IndexError, KeyError, TypeError):
+        pass
+    return out
+
+
 def parse_payload(html_text):
     m = re.search(r"<script[^>]*ds:1[^>]*>(.*?)</script>", html_text, re.S)
     if not m:
@@ -148,83 +166,87 @@ def parse_payload(html_text):
     if data.endswith("errorHasStatus: true"):
         raise RuntimeError("google returned an error status")
     payload = json.loads(data)
-    if payload[3][0] is None:
-        return []
+    suggestions = _suggestions(payload)
+    if payload[3] is None or payload[3][0] is None:
+        return [], suggestions
     itins = []
     for k in payload[3][0]:
-        flight = k[0]
-        p = k[1][0] if k[1] else None
-        if not isinstance(p, list) or len(p) < 2 or p[1] is None:
+        try:
+            flight = k[0]
+            p = k[1][0] if k[1] else None
+            if not isinstance(p, list) or len(p) < 2 or p[1] is None:
+                continue
+            price = float(p[1])
+            segs = []
+            airports = {}
+            for s in flight[2]:
+                seg = {
+                    "from": s[3],
+                    "from_name": s[4],
+                    "to": s[6],
+                    "to_name": s[5],
+                    "dep_t": _clock(s[8]),
+                    "arr_t": _clock(s[10]),
+                    "dur_min": s[11],
+                    "dep_d": tuple(s[20]),
+                    "arr_d": tuple(s[21]),
+                }
+                airports[seg["from"]] = seg["from_name"]
+                airports[seg["to"]] = seg["to_name"]
+                segs.append(seg)
+            if not segs:
+                continue
+            airlines = [a if isinstance(a, str) else a[1] for a in (flight[1] or [])]
+            codes = [segs[0]["from"]] + [s["to"] for s in segs]
+            dep_dt = datetime(*segs[0]["dep_d"], *segs[0]["dep_t"])
+            arr_dt = datetime(*segs[-1]["arr_d"], *segs[-1]["arr_t"])
+            total_min = sum(s["dur_min"] for s in segs)
+            for a, b in zip(segs, segs[1:]):
+                lay = (
+                    datetime(*b["dep_d"], *b["dep_t"])
+                    - datetime(*a["arr_d"], *a["arr_t"])
+                ).total_seconds() / 60
+                if lay > 0:
+                    total_min += lay
+            plus = (date(*segs[-1]["arr_d"]) - date(*segs[0]["dep_d"])).days
+            itins.append(
+                {
+                    "price": price,
+                    "airlines": airlines,
+                    "route": " -> ".join(codes),
+                    "stops": len(segs) - 1,
+                    "dep": dep_dt.strftime("%H:%M"),
+                    "arr": arr_dt.strftime("%H:%M"),
+                    "plus": plus,
+                    "dur_h": round(total_min / 60, 1),
+                    "airports": airports,
+                }
+            )
+        except (IndexError, KeyError, TypeError):
             continue
-        price = float(p[1])
-        segs = []
-        airports = {}
-        for s in flight[2]:
-            seg = {
-                "from": s[3],
-                "from_name": s[4],
-                "to": s[6],
-                "to_name": s[5],
-                "dep_t": _clock(s[8]),
-                "arr_t": _clock(s[10]),
-                "dur_min": s[11],
-                "dep_d": tuple(s[20]),
-                "arr_d": tuple(s[21]),
-            }
-            airports[seg["from"]] = seg["from_name"]
-            airports[seg["to"]] = seg["to_name"]
-            segs.append(seg)
-        if not segs:
-            continue
-        airlines = [a if isinstance(a, str) else a[1] for a in (flight[1] or [])]
-        codes = [segs[0]["from"]] + [s["to"] for s in segs]
-        dep_dt = datetime(*segs[0]["dep_d"], *segs[0]["dep_t"])
-        arr_dt = datetime(*segs[-1]["arr_d"], *segs[-1]["arr_t"])
-        total_min = sum(s["dur_min"] for s in segs)
-        for a, b in zip(segs, segs[1:]):
-            lay = (
-                datetime(*b["dep_d"], *b["dep_t"]) - datetime(*a["arr_d"], *a["arr_t"])
-            ).total_seconds() / 60
-            if lay > 0:
-                total_min += lay
-        plus = (date(*segs[-1]["arr_d"]) - date(*segs[0]["dep_d"])).days
-        itins.append(
-            {
-                "price": price,
-                "airlines": airlines,
-                "route": " -> ".join(codes),
-                "stops": len(segs) - 1,
-                "dep": dep_dt.strftime("%H:%M"),
-                "arr": arr_dt.strftime("%H:%M"),
-                "plus": plus,
-                "dur_h": round(total_min / 60, 1),
-                "airports": airports,
-            }
-        )
-    return itins
+    return itins, suggestions
 
 
 def fetch_with_retry(q, attempts=3):
-    last = None
     for i in range(attempts):
         try:
-            res = parse_payload(fetch_html(q))
-            if res:
-                return res, None
-            last = "no results"
+            itins, suggestions = parse_payload(fetch_html(q))
+            if itins:
+                return itins, None, []
+            return [], None, suggestions
         except Exception as e:
             last = f"{type(e).__name__}: {e}"
-        if i < attempts - 1:
-            delay = 2 + i * 3 + random.random() * 2
-            log.warning(
-                "attempt %d/%d failed (%s), retrying in %.0fs",
-                i + 1,
-                attempts,
-                last,
-                delay,
-            )
-            time.sleep(delay)
-    return None, last
+            if i < attempts - 1:
+                delay = 2 + i * 3 + random.random() * 2
+                log.warning(
+                    "attempt %d/%d failed (%s), retrying in %.0fs",
+                    i + 1,
+                    attempts,
+                    last,
+                    delay,
+                )
+                time.sleep(delay)
+    return None, last, []
 
 
 def summarize(itins):
@@ -289,16 +311,17 @@ def run_scan(cfg, conn, args, run_ts):
             kind, origin, dest, d1, d2 = spec
             key = key_of(kind, origin, dest, d1, d2, cfg)
             row = conn.execute(
-                "SELECT price, fetched_at FROM price_cache WHERE key=?", (key,)
+                "SELECT price, fetched_at, detail FROM price_cache WHERE key=?", (key,)
             ).fetchone()
             if args.force or row is None or row[1] is None:
                 todo.append((spec, key))
             else:
+                no_exact = row[2] is not None and "no_exact_results" in row[2]
                 age = (
                     now
                     - datetime.fromisoformat(row[1].replace("Z", "+00:00")).timestamp()
                 )
-                if age > ttl or row[0] is None:
+                if age > ttl or (row[0] is None and not no_exact):
                     todo.append((spec, key))
     if args.limit and len(todo) > args.limit:
         todo = todo[: args.limit]
@@ -328,7 +351,7 @@ def run_scan(cfg, conn, args, run_ts):
     )
 
     lock = threading.Lock()
-    progress = {"n": 0, "fail": 0, "cached": len(all_queries) - len(todo)}
+    progress = {"n": 0, "fail": 0, "empty": 0, "cached": len(all_queries) - len(todo)}
     scan_start = time.time()
 
     def work(item):
@@ -346,18 +369,24 @@ def run_scan(cfg, conn, args, run_ts):
             futures.append(ex.submit(work, item))
         for fut in as_completed(futures):
             spec, key, q, out, elapsed = fut.result()
+            itins, err, suggestions = out
             fetched = now_iso()
             price = None
             detail = None
             n_results = 0
-            if out[0] is not None:
-                price, detail = summarize(out[0])
-                n_results = len(out[0])
+            if itins:
+                price, detail = summarize(itins)
+                n_results = len(itins)
+            elif err is None:
+                detail = json.dumps(
+                    {"no_exact_results": True, "suggestions": suggestions},
+                    ensure_ascii=False,
+                )
             else:
-                detail = json.dumps({"error": out[1]})
+                detail = json.dumps({"error": err})
             with lock:
                 progress["n"] += 1
-                if price is None:
+                if err is not None:
                     progress["fail"] += 1
                 n, f_, c = progress["n"], progress["fail"], progress["cached"]
                 done = n + c
@@ -374,6 +403,22 @@ def run_scan(cfg, conn, args, run_ts):
                     json.loads(detail).get("route", "?"),
                     elapsed,
                 )
+            elif err is None:
+                consec_fail = 0
+                with lock:
+                    progress["empty"] += 1
+                sugg_txt = ", ".join(
+                    f"{s['d1']}→{s['d2']} {s['price']:.0f}" for s in suggestions[:4]
+                )
+                log.info(
+                    "[%d/%d] %s: no exact results (nearby: %s%s), %.1fs",
+                    done,
+                    len(all_queries),
+                    tag,
+                    sugg_txt or "none",
+                    f" +{len(suggestions) - 4} more" if len(suggestions) > 4 else "",
+                    elapsed,
+                )
             else:
                 consec_fail += 1
                 if consec_fail >= 5:
@@ -382,12 +427,11 @@ def run_scan(cfg, conn, args, run_ts):
                         consec_fail,
                     )
                 log.warning(
-                    "[%d/%d] %s: FAILED after %d attempts (%s), %.1fs",
+                    "[%d/%d] %s: FAILED after retries (%s), %.1fs",
                     done,
                     len(all_queries),
                     tag,
-                    3,
-                    out[1],
+                    err,
                     elapsed,
                 )
             prev = conn.execute(
@@ -427,10 +471,11 @@ def run_scan(cfg, conn, args, run_ts):
             conn.commit()
 
     log.info(
-        "scan finished in %.0fs: fetched=%d failed=%d cached=%d",
+        "scan finished in %.0fs: fetched=%d failed=%d empty=%d cached=%d",
         time.time() - scan_start,
         progress["n"],
         progress["fail"],
+        progress["empty"],
         progress["cached"],
     )
     return progress
@@ -1146,13 +1191,14 @@ def main():
     for it in itins[:10]:
         log.info("  %7.0f EUR  %s", it["total"], it["label"])
     log.info(
-        "done in %.0fs | HTML written to %s (%.0f KB) | fetched=%d cached=%d failed=%d",
+        "done in %.0fs | HTML written to %s (%.0f KB) | fetched=%d cached=%d failed=%d empty=%d",
         time.time() - started,
         args.out,
         len(html_doc) / 1024,
         progress["n"],
         progress["cached"],
         progress["fail"],
+        progress.get("empty", 0),
     )
 
 
