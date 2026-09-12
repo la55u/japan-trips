@@ -81,4 +81,14 @@ Failed or empty queries are retried (3×, with backoff) and refetched on the nex
 - `flight_search.py` — search, ranking, HTML generation (single file).
 - `config.toml` — all settings.
 - `flights.db` — SQLite cache + price history (created at first run, gitignored).
-- `results.html` — generated report (also deployed via GitHub Pages).
+- `results.html` — generated report.
+
+## GitHub Pages
+
+The report is published at https://la55u.github.io/japan-trips/ (served from the
+`main` branch root; `index.html` redirects to `results.html`). To update the live
+page after a run:
+
+```bash
+git add results.html && git commit -m "update results" && git push
+```
