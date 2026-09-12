@@ -726,6 +726,12 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
         ],
     }
 
+    def fmt_run_ts(ts):
+        if not ts:
+            return "none"
+        d = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
+        return d.strftime("%d %b %Y, %H:%M UTC")
+
     html_doc = TEMPLATE
     html_doc = html_doc.replace("__RUN_TS__", run_ts)
     html_doc = html_doc.replace("__HUF__", str(huf))
@@ -741,9 +747,8 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
     html_doc = html_doc.replace("__BEST_CHART__", json.dumps(best_chart))
     html_doc = html_doc.replace(
         "__META__",
-        f"Generated {run_ts} · per-person prices · prev run: {prev_ts or 'none'} · "
-        f"transfers: shinkansen {cfg['costs']['shinkansen_eur']:.0f} + domestic "
-        f"{cfg['costs']['domestic_flight_eur']:.0f} + FlixBus {cfg['costs']['flixbus_eur']:.0f} EUR/direction",
+        f"Generated {fmt_run_ts(run_ts)} · per-person prices · "
+        f"previous run: {fmt_run_ts(prev_ts)}",
     )
     return html_doc
 
@@ -775,7 +780,6 @@ TEMPLATE = """<!doctype html>
  .seg button { border: none; background: transparent; padding: 5px 16px;
                border-radius: 999px; cursor: pointer; font-size: .85rem; color: var(--muted); }
  .seg button.active { background: var(--text); color: #fff; }
- .hint { color: var(--muted); font-size: .8rem; }
  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
           gap: 12px; margin-bottom: 14px; }
  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px;
@@ -865,7 +869,6 @@ TEMPLATE = """<!doctype html>
    tbody td { padding: 7px 6px; }
    .chart-box { padding: 10px; }
    .dlg-body { padding: 12px 14px 14px; }
-   .hint { display: none; }
  }
 </style>
 </head>
@@ -880,7 +883,6 @@ TEMPLATE = """<!doctype html>
    <button id="btn-eur" class="active" onclick="setCur('EUR')">EUR</button>
    <button id="btn-huf" onclick="setCur('HUF')">HUF</button>
   </div>
-  <div class="hint">click a row for full details &middot; click a column header to sort</div>
  </div>
  <div class="cards">__CARDS__</div>
  <div class="panel table-wrap">
@@ -901,8 +903,9 @@ __ROWS__
  Open jaw = sum of two one-ways (verify the true multi-city price via the GF links).
  Times are local; (+n) = arrival n days after departure; duration includes layovers.
  For round trips the API only exposes outbound leg details, not the return leg.
- Transfers are config estimates: open jaw = shinkansen; round trip = shinkansen + domestic
- flight; FlixBus per Vienna leg. &Delta; vs previous run. Airport codes carry full names
+ Transfers are config estimates, added per person: open jaw = shinkansen;
+ round trip = shinkansen + domestic flight; FlixBus per Vienna leg
+ (shinkansen €90, domestic flight €65, FlixBus €15/direction). &Delta; vs previous run. Airport codes carry full names
  on hover &mdash; or click any row for a detail card.</p>
  <div class="charts">
   <div class="chart-box"><h3>Top itineraries &mdash; total price over runs</h3><canvas id="c1"></canvas></div>
