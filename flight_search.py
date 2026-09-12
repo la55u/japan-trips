@@ -763,6 +763,10 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
         f"Generated {fmt_run_ts(run_ts)} · per-person prices · "
         f"previous run: {fmt_run_ts(prev_ts)}",
     )
+    html_doc = html_doc.replace(
+        "__WINDOW__",
+        f"{cfg['search']['date_start']} → {cfg['search']['date_end']}",
+    )
     return html_doc
 
 
@@ -888,7 +892,7 @@ TEMPLATE = """<!doctype html>
 <body>
 <div class="wrap">
  <div class="top">
-  <h1>BUD/VIE &harr; Tokyo/Osaka deals &mdash; 12&ndash;16 days, 2027-03-25 &rarr; 2027-05-31</h1>
+  <h1>BUD/VIE &harr; Tokyo/Osaka deals &mdash; 12&ndash;16 days, <span id="window">__WINDOW__</span></h1>
   <div class="meta">__META__</div>
  </div>
  <div class="toolbar">

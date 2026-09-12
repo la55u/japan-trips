@@ -2,7 +2,7 @@
 [search]
 origins = ["BUD", "VIE"]
 destinations = ["TYO", "OSA"]
-date_start = "2027-03-25"
+date_start = "2027-03-22"
 date_end = "2027-05-31"
 trip_min_days = 12
 trip_max_days = 16

@@ -28,7 +28,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Scan next batch of stale queries
-        run: python flight_search.py --limit 140 --db flights.db --out results.html
+        run: python flight_search.py --limit 150 --db flights.db --out results.html
 
       - name: Commit updated results and cache
         run: |
@@ -36,4 +36,9 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add results.html flights.db
           git diff --cached --quiet || git commit -m "scan: refresh results and cache"
+          if ! git pull --rebase origin main; then
+            echo "::warning::rebase conflict on data files - keeping remote state, this run's rows will be refetched next scan"
+            git rebase --abort 2>/dev/null || true
+            git reset --hard origin/main
+          fi
           git push

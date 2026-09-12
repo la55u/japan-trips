@@ -2,7 +2,7 @@
 
 Scans Google Flights (via [fast-flights](https://github.com/AWeirdDev/fast-flights)) for
 cheap trips from Budapest/Vienna to Tokyo/Osaka and renders the best deals to a static
-HTML page. Built for a 12–16 day trip between 2027-03-25 and 2027-05-31, but every knob
+HTML page. Built for a 12–16 day trip between 2027-03-22 and 2027-05-31, but every knob
 is configurable.
 
 ## What it does
@@ -52,7 +52,7 @@ overwrite each other's price history:
 
 | | DB | Report | Committed to git |
 |---|---|---|---|
-| **CI (GitHub Actions, 4×/day)** | `flights.db` | `results.html` → GitHub Pages | yes |
+| **CI (GitHub Actions, 12×/day)** | `flights.db` | `results.html` → GitHub Pages | yes |
 | **Local runs (default)** | `flights_local.db` | `results_local.html` | no (gitignored) |
 
 Local runs never touch `flights.db`/`results.html`, and the CI workflow explicitly
@@ -99,8 +99,8 @@ Failed or empty queries are retried (3×, with backoff) and refetched on the nex
 ## Automation (GitHub Actions)
 
 The `.github/workflows/scan.yml` workflow runs every 2 hours (12×/day; GitHub may
-delay scheduled runs by some minutes). Each run fetches the next ~140 stale queries
-(`--limit 140 --db flights.db`, cache TTL 24 h), so the whole scan window is refreshed
+delay scheduled runs by some minutes). Each run fetches the next ~150 stale queries
+(`--limit 150 --db flights.db`, cache TTL 24 h), so the whole scan window is refreshed
 roughly once a day while the page updates every 2 hours. After
 scanning, the workflow commits `results.html` and `flights.db` back to `main`, and
 GitHub Pages redeploys automatically. `flights.db` is committed so price history and
