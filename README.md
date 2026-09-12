@@ -70,6 +70,9 @@ push promptly (the DB is a binary file and cannot merge).
 - Legs show route (hover airport codes for full names), local departure/arrival times,
   `(+n)` = arrival n days after departure, total duration in hours incl. layovers, stops,
   airlines, and Google Flights links to verify/book.
+- Round-trip return legs show a **reference** (the best one-way on the same date, marked
+  ≈): Google's API does not expose return-leg details for round-trip searches — verify
+  the actual return via the Google Flights link.
 - Δ column shows price movement vs the previous run.
 - Click/tap any row for a detail card (native HTML dialog): full airport names, times,
   durations, itemized cost breakdown, and Google Flights links.
@@ -95,10 +98,10 @@ Failed or empty queries are retried (3×, with backoff) and refetched on the nex
 
 ## Automation (GitHub Actions)
 
-The `.github/workflows/scan.yml` workflow runs 4×/day (05:00, 11:00, 17:00, 23:00
-Budapest time; GitHub may delay scheduled runs by some minutes). Each run fetches the
-next 400 stale queries (`--limit 400 --db flights.db`, cache TTL 24 h), so the whole
-scan window is refreshed roughly once a day while the page updates 4×/day. After
+The `.github/workflows/scan.yml` workflow runs every 2 hours (12×/day; GitHub may
+delay scheduled runs by some minutes). Each run fetches the next ~140 stale queries
+(`--limit 140 --db flights.db`, cache TTL 24 h), so the whole scan window is refreshed
+roughly once a day while the page updates every 2 hours. After
 scanning, the workflow commits `results.html` and `flights.db` back to `main`, and
 GitHub Pages redeploys automatically. `flights.db` is committed so price history and
 deltas accumulate across runs; it is written **only by CI** (see "Local vs CI data").

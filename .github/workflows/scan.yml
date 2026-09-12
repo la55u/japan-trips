@@ -2,7 +2,7 @@ name: scan
 
 on:
   schedule:
-    - cron: "0 3,9,15,21 * * *" # 05:00, 11:00, 17:00, 23:00 Budapest
+    - cron: "0 */2 * * *" # every 2 hours (05:00, 07:00, ... Budapest)
   workflow_dispatch:
 
 permissions:
@@ -28,7 +28,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Scan next batch of stale queries
-        run: python flight_search.py --limit 400 --db flights.db --out results.html
+        run: python flight_search.py --limit 140 --db flights.db --out results.html
 
       - name: Commit updated results and cache
         run: |

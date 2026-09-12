@@ -496,6 +496,11 @@ def build_itineraries(cfg, rows):
                     rt = rows.get(("RT", origin, dest, d1s, d2s))
                     if rt:
                         tr_total, tr_items = transfers_for("RT", origin, dest, cfg)
+                        ow_ref = rows.get(("OW", dest, origin, d2s, ""))
+                        ret_detail = None
+                        if ow_ref:
+                            ret_detail = dict(ow_ref)
+                            ret_detail["is_reference"] = True
                         itins.append(
                             {
                                 "key": f"RT|{origin}|{dest}|{d1s}|{d2s}",
@@ -508,7 +513,8 @@ def build_itineraries(cfg, rows):
                                 "d2": d2s,
                                 "airfare": rt["price"],
                                 "out_detail": rt,
-                                "ret_detail": rt,
+                                "ret_detail": ret_detail,
+                                "ret_unavailable": ret_detail is None,
                                 "transfers": tr_total,
                                 "transfer_items": tr_items,
                             }
@@ -589,7 +595,8 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
             )
         names = d.get("airports") or {}
         route = d.get("route", "")
-        route_html = " → ".join(
+        ref = d.get("is_reference")
+        route_html = ("≈ " if ref else "") + " → ".join(
             f'<span title="{html.escape(names.get(c, c))}">{html.escape(c)}</span>'
             for c in route.split(" -> ")
         )
@@ -602,10 +609,16 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
                 times += f" · {d['dur_h']}h"
         stops = d.get("stops")
         stops_txt = f" ({stops} stop{'s' if stops != 1 else ''})" if stops else ""
+        ref_txt = (
+            "<br><small><i>reference: best one-way on this date</i></small>"
+            if ref
+            else ""
+        )
         return (
             f"<td>{route_html}{stops_txt}<br>"
             f"<small>{html.escape(times)}</small><br>"
-            f"<small>{', '.join(html.escape(a) for a in d.get('airlines', []))}</small></td>"
+            f"<small>{', '.join(html.escape(a) for a in d.get('airlines', []))}</small>"
+            f"{ref_txt}</td>"
         )
 
     rows_html = []
@@ -646,7 +659,7 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
             f"<td>{fmt_date(it['d1'])}</td><td>{fmt_date(it['d2'])}</td>"
             f'<td class="num">{(date.fromisoformat(it["d2"]) - date.fromisoformat(it["d1"])).days}</td>'
             f"{leg_cell(o)}"
-            f"{leg_cell(r, unavailable=(it['kind'] == 'RT'))}"
+            f"{leg_cell(r, unavailable=it.get('ret_unavailable', False))}"
             f'<td class="num" data-eur="{it["airfare"]:.0f}">{it["airfare"]:.0f}</td>'
             f'<td class="num" data-eur="{it["transfers"]:.0f}" title="{html.escape(tr_items)}">{it["transfers"]:.0f}</td>'
             f'<td class="num total" data-eur="{it["total"]:.0f}">{it["total"]:.0f}</td>'
@@ -669,8 +682,8 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
                 "transfer_items": it["transfer_items"],
                 "gf_links": gf_links,
                 "out": o,
-                "ret": r if it["kind"] == "OJ" else None,
-                "ret_unavailable": it["kind"] == "RT",
+                "ret": r,
+                "ret_unavailable": it.get("ret_unavailable", False),
             }
         )
 
@@ -902,7 +915,9 @@ __ROWS__
  <p class="foot">Prices per person, 1-adult query, checked bag included, max 2 stops.
  Open jaw = sum of two one-ways (verify the true multi-city price via the GF links).
  Times are local; (+n) = arrival n days after departure; duration includes layovers.
- For round trips the API only exposes outbound leg details, not the return leg.
+ For round trips the API only exposes outbound leg details; the return column shows a
+ <i>reference</i> (the best one-way on the same date) &mdash; the actual return flight may
+ differ, verify via the GF links.
  Transfers are config estimates, added per person: open jaw = shinkansen;
  round trip = shinkansen + domestic flight; FlixBus per Vienna leg
  (shinkansen €90, domestic flight €65, FlixBus €15/direction). &Delta; vs previous run. Airport codes carry full names
@@ -970,25 +985,32 @@ function fdate(iso) {
     { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
 }
 function legHtml(d, label, unavailable) {
-  if (!d || unavailable) {
+  if (!d || (unavailable && !d.is_reference)) {
     return `<div class="dlg-leg"><h3>${label}</h3>
       <div class="muted">Leg details are not exposed by the API for round-trip queries &mdash;
       use the Google Flights link below to verify.</div></div>`;
   }
+  const ref = !!d.is_reference;
   const names = d.airports || {};
   const codes = (d.route || '').split(' -> ');
-  const route = codes.map(c => `<span title="${esc(names[c] || c)}">${esc(c)}</span>`).join(' → ');
+  const route = (ref ? '≈ ' : '') + codes.map(c => `<span title="${esc(names[c] || c)}">${esc(c)}</span>`).join(' → ');
   const nameList = [...new Set(codes.map(c => names[c] || c))].join(' · ');
   const times = d.dep ? `${esc(d.dep)} → ${esc(d.arr)}` +
     (d.plus ? ` (+${d.plus})` : '') + (d.dur_h ? ` · ${d.dur_h}h` : '') : '';
   const stops = (d.stops ?? null) === null ? '' :
     ` · ${d.stops} stop${d.stops === 1 ? '' : 's'}`;
   const fetched = d.fetched_at ? `fetched ${esc(d.fetched_at.replace('T', ' ').replace('Z', ' UTC'))}` : '';
-  return `<div class="dlg-leg"><h3>${label}</h3>
+  const refNote = ref
+    ? `<div class="muted" style="font-size:.78rem;margin-top:4px">Reference only: the API does not expose
+       round-trip return legs, so this is the best one-way on the same date &mdash; your actual
+       return flight may differ. Verify via the Google Flights link.</div>`
+    : '';
+  return `<div class="dlg-leg"><h3>${label}${ref ? ' (reference)' : ''}</h3>
     <div class="route">${route}</div>
     <div class="airports">${esc(nameList)}</div>
     <div>${times}${stops}</div>
     <div><small>${esc((d.airlines || []).join(', '))}</small></div>
+    ${refNote}
     <div class="fetched">${fetched}</div></div>`;
 }
 function showDetails(it) {
