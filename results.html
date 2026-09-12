@@ -121,7 +121,7 @@
 <div class="wrap">
  <div class="top">
   <h1>BUD/VIE &harr; Tokyo/Osaka deals &mdash; 12&ndash;16 days, <span id="window">2027-03-22 → 2027-05-31</span></h1>
-  <div class="meta">Generated 12 Sep 2026, 19:37 UTC · per-person prices · previous run: 12 Sep 2026, 19:33 UTC</div>
+  <div class="meta">Generated 12 Sep 2026, 19:58 UTC · per-person prices · previous run: 12 Sep 2026, 19:37 UTC</div>
  </div>
  <div class="toolbar">
   <div class="seg">
@@ -186,9 +186,9 @@
  <p class="foot">Prices per person, 1-adult query, checked bag included, max 2 stops.
  Open jaw = sum of two one-ways (verify the true multi-city price via the GF links).
  Times are local; (+n) = arrival n days after departure; duration includes layovers.
- For round trips the API only exposes outbound leg details; the return column shows a
- <i>reference</i> (the best one-way on the same date) &mdash; the actual return flight may
- differ, verify via the GF links.
+ For round trips the return leg is the actual flight paired with the shown outbound when
+ available (fetched via Google's selection API), otherwise a <i>reference</i> (the best
+ one-way on the same date, marked &asymp;) &mdash; verify via the GF links.
  Transfers are config estimates, added per person: open jaw = shinkansen;
  round trip = shinkansen + domestic flight; FlixBus per Vienna leg
  (shinkansen €90, domestic flight €65, FlixBus €15/direction). &Delta; vs previous run. Airport codes carry full names
@@ -258,7 +258,7 @@ function fdate(iso) {
 function legHtml(d, label, unavailable) {
   if (!d || (unavailable && !d.is_reference)) {
     return `<div class="dlg-leg"><h3>${label}</h3>
-      <div class="muted">Leg details are not exposed by the API for round-trip queries &mdash;
+      <div class="muted">No leg details available for this row &mdash;
       use the Google Flights link below to verify.</div></div>`;
   }
   const ref = !!d.is_reference;
@@ -323,8 +323,8 @@ document.querySelectorAll('#tbl tbody tr').forEach(tr => {
   });
 });
 dlg.addEventListener('click', e => { if (e.target === dlg) dlg.close(); });
-const chartData = {"labels": ["09-12 17:45", "09-12 17:50", "09-12 17:51", "09-12 18:03", "09-12 18:03", "09-12 18:03", "09-12 18:04", "09-12 18:04", "09-12 18:10", "09-12 18:11", "09-12 18:15", "09-12 18:29", "09-12 18:34", "09-12 19:02", "09-12 19:09", "09-12 19:24", "09-12 19:33", "09-12 19:37"], "datasets": [{"label": "Round trip VIE\u2192TYO (via TYO/TYO) 2027-04-25 \u2192 2027-05-07", "data": [null, null, null, null, null, null, null, null, null, null, null, null, 847.0, 847.0, 847.0, 847.0, 847.0, 847.0], "borderColor": "#4e79a7", "backgroundColor": "#4e79a7", "spanGaps": true, "tension": 0.25, "pointRadius": 3}, {"label": "Round trip VIE\u2192TYO (via TYO/TYO) 2027-04-29 \u2192 2027-05-14", "data": [null, null, null, null, null, null, null, null, null, null, null, null, 887.0, 887.0, 887.0, 887.0, 887.0, 887.0], "borderColor": "#f28e2b", "backgroundColor": "#f28e2b", "spanGaps": true, "tension": 0.25, "pointRadius": 3}, {"label": "Round trip VIE\u2192TYO (via TYO/TYO) 2027-04-20 \u2192 2027-05-05", "data": [null, null, null, null, null, null, null, null, null, null, null, null, 929.0, 929.0, 929.0, 929.0, 929.0, 929.0], "borderColor": "#e15759", "backgroundColor": "#e15759", "spanGaps": true, "tension": 0.25, "pointRadius": 3}, {"label": "Round trip VIE\u2192TYO (via TYO/TYO) 2027-04-25 \u2192 2027-05-08", "data": [null, null, null, null, null, null, null, null, null, null, null, null, 929.0, 929.0, 929.0, 929.0, 929.0, 929.0], "borderColor": "#76b7b2", "backgroundColor": "#76b7b2", "spanGaps": true, "tension": 0.25, "pointRadius": 3}, {"label": "Round trip VIE\u2192TYO (via TYO/TYO) 2027-04-25 \u2192 2027-05-10", "data": [null, null, null, null, null, null, null, null, null, null, null, null, 929.0, 929.0, 929.0, 929.0, 929.0, 929.0], "borderColor": "#59a14f", "backgroundColor": "#59a14f", "spanGaps": true, "tension": 0.25, "pointRadius": 3}, {"label": "Round trip VIE\u2192TYO (via TYO/TYO) 2027-04-27 \u2192 2027-05-10", "data": [null, null, null, null, null, null, null, null, null, null, null, null, 929.0, 929.0, 929.0, 929.0, 929.0, 929.0], "borderColor": "#edc948", "backgroundColor": "#edc948", "spanGaps": true, "tension": 0.25, "pointRadius": 3}]};
-const bestChart = {"labels": ["09-12 17:45", "09-12 17:50", "09-12 17:51", "09-12 18:03", "09-12 18:03", "09-12 18:03", "09-12 18:04", "09-12 18:04", "09-12 18:10", "09-12 18:11", "09-12 18:15", "09-12 18:29", "09-12 18:34", "09-12 19:02", "09-12 19:09", "09-12 19:24", "09-12 19:33", "09-12 19:37"], "datasets": [{"label": "Cheapest total (EUR/person)", "data": [1350.0, 1350.0, 1362.0, 1350.0, 1350.0, 1350.0, 1350.0, 1350.0, 1350.0, 1350.0, 1072.0, 1072.0, 847.0, 847.0, 847.0, 847.0, 847.0, 847.0], "borderColor": "#4e79a7", "spanGaps": true, "tension": 0.25}]};
+const chartData = {"labels": ["09-12 17:45", "09-12 17:50", "09-12 17:51", "09-12 18:03", "09-12 18:03", "09-12 18:03", "09-12 18:04", "09-12 18:04", "09-12 18:10", "09-12 18:11", "09-12 18:15", "09-12 18:29", "09-12 18:34", "09-12 19:02", "09-12 19:09", "09-12 19:24", "09-12 19:33", "09-12 19:37", "09-12 19:58"], "datasets": [{"label": "Round trip VIE\u2192TYO (via TYO/TYO) 2027-04-25 \u2192 2027-05-07", "data": [null, null, null, null, null, null, null, null, null, null, null, null, 847.0, 847.0, 847.0, 847.0, 847.0, 847.0, 847.0], "borderColor": "#4e79a7", "backgroundColor": "#4e79a7", "spanGaps": true, "tension": 0.25, "pointRadius": 3}, {"label": "Round trip VIE\u2192TYO (via TYO/TYO) 2027-04-29 \u2192 2027-05-14", "data": [null, null, null, null, null, null, null, null, null, null, null, null, 887.0, 887.0, 887.0, 887.0, 887.0, 887.0, 887.0], "borderColor": "#f28e2b", "backgroundColor": "#f28e2b", "spanGaps": true, "tension": 0.25, "pointRadius": 3}, {"label": "Round trip VIE\u2192TYO (via TYO/TYO) 2027-04-20 \u2192 2027-05-05", "data": [null, null, null, null, null, null, null, null, null, null, null, null, 929.0, 929.0, 929.0, 929.0, 929.0, 929.0, 929.0], "borderColor": "#e15759", "backgroundColor": "#e15759", "spanGaps": true, "tension": 0.25, "pointRadius": 3}, {"label": "Round trip VIE\u2192TYO (via TYO/TYO) 2027-04-25 \u2192 2027-05-08", "data": [null, null, null, null, null, null, null, null, null, null, null, null, 929.0, 929.0, 929.0, 929.0, 929.0, 929.0, 929.0], "borderColor": "#76b7b2", "backgroundColor": "#76b7b2", "spanGaps": true, "tension": 0.25, "pointRadius": 3}, {"label": "Round trip VIE\u2192TYO (via TYO/TYO) 2027-04-25 \u2192 2027-05-10", "data": [null, null, null, null, null, null, null, null, null, null, null, null, 929.0, 929.0, 929.0, 929.0, 929.0, 929.0, 929.0], "borderColor": "#59a14f", "backgroundColor": "#59a14f", "spanGaps": true, "tension": 0.25, "pointRadius": 3}, {"label": "Round trip VIE\u2192TYO (via TYO/TYO) 2027-04-27 \u2192 2027-05-10", "data": [null, null, null, null, null, null, null, null, null, null, null, null, 929.0, 929.0, 929.0, 929.0, 929.0, 929.0, 929.0], "borderColor": "#edc948", "backgroundColor": "#edc948", "spanGaps": true, "tension": 0.25, "pointRadius": 3}]};
+const bestChart = {"labels": ["09-12 17:45", "09-12 17:50", "09-12 17:51", "09-12 18:03", "09-12 18:03", "09-12 18:03", "09-12 18:04", "09-12 18:04", "09-12 18:10", "09-12 18:11", "09-12 18:15", "09-12 18:29", "09-12 18:34", "09-12 19:02", "09-12 19:09", "09-12 19:24", "09-12 19:33", "09-12 19:37", "09-12 19:58"], "datasets": [{"label": "Cheapest total (EUR/person)", "data": [1350.0, 1350.0, 1362.0, 1350.0, 1350.0, 1350.0, 1350.0, 1350.0, 1350.0, 1350.0, 1072.0, 1072.0, 847.0, 847.0, 847.0, 847.0, 847.0, 847.0, 847.0], "borderColor": "#4e79a7", "spanGaps": true, "tension": 0.25}]};
 new Chart(document.getElementById('c1'), {
   type: 'line', data: chartData,
   options: { scales: { y: { title: { display: true, text: 'EUR/person' } } },
