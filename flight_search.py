@@ -100,6 +100,9 @@ def init_db(path: str) -> sqlite3.Connection:
             run_ts TEXT PRIMARY KEY, fetched INTEGER, cached INTEGER,
             failed INTEGER, note TEXT
         );
+        CREATE TABLE IF NOT EXISTS state (
+            key TEXT PRIMARY KEY, value TEXT
+        );
         """
     )
     conn.commit()
@@ -476,7 +479,31 @@ def run_scan(cfg, conn, args, run_ts):
                 if age > ttl or (row[0] is None and not no_exact):
                     todo.append((spec, key))
     if args.limit and len(todo) > args.limit:
+        cursor = 0
+        cur_row = conn.execute(
+            "SELECT value FROM state WHERE key='scan_cursor'"
+        ).fetchone()
+        if cur_row:
+            try:
+                cursor = int(cur_row[0])
+            except ValueError:
+                cursor = 0
+        off = cursor % len(todo)
+        stale_total = len(todo)
+        todo = todo[off:] + todo[:off]
         todo = todo[: args.limit]
+        conn.execute(
+            "INSERT INTO state (key, value) VALUES ('scan_cursor', ?)"
+            " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(cursor + args.limit),),
+        )
+        conn.commit()
+        log.info(
+            "rotated scan window: offset %d of %d stale queries (cursor=%d)",
+            off,
+            stale_total,
+            cursor + args.limit,
+        )
 
     log.info(
         "run %s | window %s..%s | trip %d-%dd | origins=%s destinations=%s "
@@ -739,28 +766,29 @@ def build_itineraries(cfg, rows):
                             }
                         )
                     for in_city, out_city in [(OSA, TYO), (TYO, OSA)]:
-                        out_leg = rows.get(("OW", origin, in_city, d1s, ""))
-                        ret_leg = rows.get(("OW", out_city, dest, d2s, ""))
-                        if not (out_leg and ret_leg):
-                            continue
-                        tr_total, tr_items = transfers_for("OJ", origin, dest, cfg)
-                        itins.append(
-                            {
-                                "key": f"OJ|{origin}|{dest}|{in_city}|{out_city}|{d1s}|{d2s}",
-                                "kind": "OJ",
-                                "out_origin": origin,
-                                "ret_dest": dest,
-                                "in_city": in_city,
-                                "out_city": out_city,
-                                "d1": d1s,
-                                "d2": d2s,
-                                "airfare": out_leg["price"] + ret_leg["price"],
-                                "out_detail": out_leg,
-                                "ret_detail": ret_leg,
-                                "transfers": tr_total,
-                                "transfer_items": tr_items,
-                            }
-                        )
+                        for home in s["origins"]:
+                            out_leg = rows.get(("OW", origin, in_city, d1s, ""))
+                            ret_leg = rows.get(("OW", out_city, home, d2s, ""))
+                            if not (out_leg and ret_leg):
+                                continue
+                            tr_total, tr_items = transfers_for("OJ", origin, home, cfg)
+                            itins.append(
+                                {
+                                    "key": f"OJ|{origin}|{home}|{in_city}|{out_city}|{d1s}|{d2s}",
+                                    "kind": "OJ",
+                                    "out_origin": origin,
+                                    "ret_dest": home,
+                                    "in_city": in_city,
+                                    "out_city": out_city,
+                                    "d1": d1s,
+                                    "d2": d2s,
+                                    "airfare": out_leg["price"] + ret_leg["price"],
+                                    "out_detail": out_leg,
+                                    "ret_detail": ret_leg,
+                                    "transfers": tr_total,
+                                    "transfer_items": tr_items,
+                                }
+                            )
     for it in itins:
         it["total"] = it["airfare"] + it["transfers"]
     itins.sort(key=lambda x: x["total"])
