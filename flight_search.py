@@ -481,13 +481,76 @@ def run_skyscanner_if_due(cfg, conn, args, itins):
     seen = set()
     combos = []
     for it in itins:
+        if it["kind"] != "RT":
+            continue
         key = (it["out_origin"], it["in_city"], it["d1"], it["d2"])
         if key in seen:
             continue
         seen.add(key)
         combos.append((it["out_origin"], it["in_city"], it["d1"], it["d2"]))
-        if len(combos) >= sk_cfg.get("combos", 6):
+        if len(combos) >= 3:
             break
+    n_google = len(combos)
+    n_total = sk_cfg.get("combos", 6)
+    n_discovery = max(0, n_total - n_google)
+
+    if n_discovery:
+        oj_map = {}
+        for it in itins:
+            if it["kind"] != "OJ":
+                continue
+            key = (it["out_origin"], it["in_city"], it["d1"], it["d2"])
+            cur = oj_map.get(key)
+            if cur is None or it["airfare"] < cur:
+                oj_map[key] = it["airfare"]
+        rt_map = {}
+        for it in itins:
+            if it["kind"] != "RT":
+                continue
+            key = (it["out_origin"], it["in_city"], it["d1"], it["d2"])
+            rt_map.setdefault(key, it["airfare"])
+        gaps = []
+        for key, oj_price in oj_map.items():
+            rt_price = rt_map.get(key)
+            if rt_price is None:
+                continue
+            gaps.append((rt_price - oj_price, key))
+        gaps.sort(reverse=True)
+        existing = {
+            (r[0], r[1], r[2], r[3])
+            for r in conn.execute("SELECT origin, dest, d1, d2 FROM skyscanner_prices")
+        }
+        cursor = 0
+        cur_row = conn.execute(
+            "SELECT value FROM state WHERE key='skyscanner_discover_cursor'"
+        ).fetchone()
+        if cur_row:
+            try:
+                cursor = int(cur_row[0])
+            except ValueError:
+                cursor = 0
+        if gaps:
+            off = cursor % len(gaps)
+            ordered = gaps[off:] + gaps[:off]
+            for gap, key in ordered:
+                if len(combos) >= n_total:
+                    break
+                if key in existing or key in combos:
+                    continue
+                if gap <= 50:
+                    break
+                combos.append(key)
+        conn.execute(
+            "INSERT INTO state (key, value) VALUES ('skyscanner_discover_cursor', ?)"
+            " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(cursor + n_discovery),),
+        )
+        log.info(
+            "skyscanner combos: %d from google top + %d gap-discovery "
+            "(largest RT-OJ gaps, rotating)",
+            n_google,
+            len(combos) - n_google,
+        )
     if not combos:
         return
     log.info("skyscanner spot-check starting for %d combos", len(combos))
