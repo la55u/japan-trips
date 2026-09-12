@@ -46,7 +46,9 @@ Useful flags: `--workers N`, `--step N` (scan every Nth day), `--top N`, `--out 
 `--config FILE`.
 
 Run it a few times a day; results.html and the price-history charts accumulate across
-runs, with ▲/▼ deltas vs the previous run.
+runs, with ▲/▼ deltas vs the previous run. Every query result is committed to
+`flights.db` as soon as it arrives, so a run can be interrupted at any point without
+losing progress — the next run only fetches what's still missing or stale.
 
 ## Output (`results.html`)
 
@@ -75,6 +77,16 @@ Failed or empty queries are retried (3×, with backoff) and refetched on the nex
   fares aren't bookable yet.
 - Ranking uses the 1-adult fare; a specific fare may not be available for 2 seats.
 - Scraping Google Flights is unofficial and may break if the page structure changes.
+
+## Automation (GitHub Actions)
+
+The `.github/workflows/scan.yml` workflow runs 4×/day (05:00, 11:00, 17:00, 23:00
+Budapest time; GitHub may delay scheduled runs by some minutes). Each run fetches the
+next 400 stale queries (`--limit 400`, cache TTL 24 h), so the whole scan window is
+refreshed roughly once a day while the page updates 4×/day. After scanning, the
+workflow commits `results.html` and `flights.db` back to `main`, and GitHub Pages
+redeploys automatically. `flights.db` is committed so price history and deltas
+accumulate across runs. Manual runs: *Actions → scan → Run workflow*.
 
 ## Files
 

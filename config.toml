@@ -21,7 +21,7 @@ huf_per_eur = 395.0
 
 [cache]
 db = "flights.db"
-ttl_hours = 4
+ttl_hours = 24
 
 [scan]
 workers = 2
