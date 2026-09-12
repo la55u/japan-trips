@@ -997,6 +997,65 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
         d = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
         return d.strftime("%d %b %Y, %H:%M UTC")
 
+    def _age_hours(ts):
+        if not ts:
+            return None
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+
+    stats_q = {
+        "priced": "SELECT COUNT(*) FROM price_cache WHERE price IS NOT NULL",
+        "empty": "SELECT COUNT(*) FROM price_cache WHERE detail LIKE '%no_exact_results%'",
+        "by_kind": (
+            "SELECT kind, COUNT(*) FROM price_cache WHERE price IS NOT NULL"
+            " GROUP BY kind"
+        ),
+        "hist": "SELECT COUNT(*) FROM price_history",
+        "runs": "SELECT COUNT(*) FROM runs",
+        "oldest": "SELECT MIN(fetched_at) FROM price_cache WHERE price IS NOT NULL",
+        "newest": "SELECT MAX(fetched_at) FROM price_cache WHERE price IS NOT NULL",
+    }
+    priced = conn.execute(stats_q["priced"]).fetchone()[0]
+    empty = conn.execute(stats_q["empty"]).fetchone()[0]
+    kinds = dict(conn.execute(stats_q["by_kind"]).fetchall())
+    hist = conn.execute(stats_q["hist"]).fetchone()[0]
+    runs_n = conn.execute(stats_q["runs"]).fetchone()[0]
+    oldest = conn.execute(stats_q["oldest"]).fetchone()[0]
+    newest = conn.execute(stats_q["newest"]).fetchone()[0]
+    planned = len(plan_queries(cfg))
+
+    kind_txt = " · ".join(f"{kinds[k]:,} {k}" for k in ("RT", "OW") if kinds.get(k))
+    newest_age = _age_hours(newest)
+    oldest_age = _age_hours(oldest)
+    stat_items = [
+        (f"{priced:,}", "prices tracked", kind_txt),
+        (f"{priced + empty}/{planned}", "date pairs checked", f"{empty} flexible-only"),
+        (
+            f"{newest_age:.0f}h" if newest_age is not None else "–",
+            "newest cached price",
+            None,
+        ),
+        (
+            f"{oldest_age:.0f}h" if oldest_age is not None else "–",
+            "stalest cached price",
+            f"refreshed within {cfg['cache']['ttl_hours']}h",
+        ),
+        (f"{hist:,}", "history points", None),
+        (f"{runs_n}", "runs recorded", None),
+        (
+            f"{progress['n']}",
+            "fetched this run",
+            f"{progress.get('empty', 0)} flexible-only, {progress['fail']} failed",
+        ),
+    ]
+    stats_html = ""
+    for value, label, sub in stat_items:
+        sub_html = f"<small>{html.escape(sub)}</small>" if sub else ""
+        stats_html += (
+            f'<span class="stat" title="{html.escape(label)}">'
+            f"<b>{value}</b> {html.escape(label)} {sub_html}</span>"
+        )
+
     html_doc = TEMPLATE
     html_doc = html_doc.replace("__RUN_TS__", run_ts)
     html_doc = html_doc.replace("__HUF__", str(huf))
@@ -1006,6 +1065,7 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
         + card("Cheapest round trip", best_rt)
         + card("Cheapest open jaw", best_oj),
     )
+    html_doc = html_doc.replace("__STATS__", stats_html)
     html_doc = html_doc.replace("__ROWS__", "\n".join(rows_html))
     html_doc = html_doc.replace("__ITINS__", json.dumps(shown_json, ensure_ascii=False))
     html_doc = html_doc.replace("__CHART_DATA__", json.dumps(chart_data))
@@ -1049,6 +1109,10 @@ TEMPLATE = """<!doctype html>
  .seg button { border: none; background: transparent; padding: 5px 16px;
                border-radius: 999px; cursor: pointer; font-size: .85rem; color: var(--muted); }
  .seg button.active { background: var(--text); color: #fff; }
+ .stats { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 14px; }
+ .stat { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+         padding: 6px 12px; font-size: .78rem; color: var(--muted); }
+ .stat b { color: var(--text); font-weight: 650; font-variant-numeric: tabular-nums; }
  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
           gap: 12px; margin-bottom: 14px; }
  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px;
@@ -1153,6 +1217,7 @@ TEMPLATE = """<!doctype html>
    <button id="btn-huf" onclick="setCur('HUF')">HUF</button>
   </div>
  </div>
+ <div class="stats">__STATS__</div>
  <div class="cards">__CARDS__</div>
  <div class="panel table-wrap">
  <table id="tbl">
