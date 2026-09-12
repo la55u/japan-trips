@@ -170,6 +170,19 @@ def _itinerary_from_entry(k):
         if lay > 0:
             total_min += lay
     plus = (date(*segs[-1]["arr_d"]) - date(*segs[0]["dep_d"])).days
+    legs = []
+    for s in flight[2]:
+        num = s[22] if len(s) > 22 else None
+        legs.append(
+            {
+                "from": s[3],
+                "date": date(*s[20]).isoformat(),
+                "to": s[6],
+                "airline": num[0] if num else None,
+                "num": num[1] if num else None,
+            }
+        )
+    blob = k[1][1] if isinstance(k[1], list) and len(k[1]) > 1 else None
     return {
         "price": price,
         "airlines": airlines,
@@ -180,6 +193,8 @@ def _itinerary_from_entry(k):
         "plus": plus,
         "dur_h": round(total_min / 60, 1),
         "airports": airports,
+        "blob": blob,
+        "legs": legs,
     }
 
 
@@ -189,39 +204,32 @@ RPC_PATH = (
 )
 
 
-def fetch_rpc_itins(client, page_html):
-    """For the null-variant pages (ds:1 empty, suggestions instead of results),
-    replay the GetShoppingResults RPC the browser would issue, using the request
-    template Google embedded in the page itself."""
+def _rpc_extras(page_html):
     token_m = re.search(r"[A-Za-z0-9_-]{6,}-{6,}[A-Za-z0-9_-]{6,}", page_html)
     fsid_m = re.search(r'FdrFJe":"(-?[0-9]+)', page_html)
     bl_m = re.search(r'cfb2h":"([a-z0-9_.-]+)"', page_html)
     req_m = re.search(r"'ds:1'\s*:\s*\{id:'[^']*',request:", page_html)
     if not (token_m and fsid_m and bl_m and req_m):
-        return []
+        return None
     try:
         req_json, _ = json.JSONDecoder().raw_decode(page_html, req_m.end())
     except json.JSONDecodeError:
-        return []
+        return None
     if len(req_json) < 2:
-        return []
-    inner_req = [
-        [None, None, None, token_m.group(0)],
-        req_json[1],
-        0,
-        0,
-        0,
-        1,
-    ]
+        return None
+    return token_m.group(0), fsid_m.group(1), bl_m.group(1), req_json
+
+
+def _rpc_post(client, fsid, bl, inner_req):
     url = (
-        f"{RPC_PATH}?f.sid={fsid_m.group(1)}&bl={bl_m.group(1)}"
+        f"{RPC_PATH}?f.sid={fsid}&bl={bl}"
         "&hl=en&soc-app=162&soc-platform=1&soc-device=1&_reqid=100001&rt=c"
         "&curr=EUR"
     )
     body = "f.req=" + json.dumps(
         [None, json.dumps(inner_req, separators=(",", ":"))], separators=(",", ":")
     )
-    resp = client.post(
+    return client.post(
         url,
         headers={
             "Cookie": SOCS_COOKIE,
@@ -229,11 +237,12 @@ def fetch_rpc_itins(client, page_html):
         },
         data=body,
     )
-    if resp.status_code != 200:
-        return []
+
+
+def _parse_rpc_itins(rpc_text):
     itins = []
     seen = set()
-    for line in resp.text.split("\n"):
+    for line in rpc_text.split("\n"):
         if not line.startswith("[["):
             continue
         try:
@@ -260,6 +269,60 @@ def fetch_rpc_itins(client, page_html):
                         seen.add(key)
                         itins.append(it)
     return itins
+
+
+def fetch_rpc_itins(client, page_html):
+    """For the null-variant pages (ds:1 empty, suggestions instead of results),
+    replay the GetShoppingResults RPC the browser would issue, using the request
+    template Google embedded in the page itself."""
+    extras = _rpc_extras(page_html)
+    if not extras:
+        return []
+    token, fsid, bl, req_json = extras
+    inner_req = [[None, None, None, token], req_json[1], 0, 0, 0, 1]
+    resp = _rpc_post(client, fsid, bl, inner_req)
+    if resp.status_code != 200:
+        return []
+    return _parse_rpc_itins(resp.text)
+
+
+def _find_legs_index(inner2):
+    for i, el in enumerate(inner2):
+        if (
+            isinstance(el, list)
+            and len(el) == 2
+            and all(isinstance(x, list) and x and isinstance(x[0], list) for x in el)
+        ):
+            return i
+    return None
+
+
+def fetch_return_legs(client, page_html, best):
+    """Replay the 'Select flight' RPC: returns the actual return itineraries
+    bookable in combination with the given (selected) outbound."""
+    extras = _rpc_extras(page_html)
+    if not extras or not best.get("blob") or not best.get("legs"):
+        return []
+    token, fsid, bl, req_json = extras
+    inner2 = json.loads(json.dumps(req_json[1]))
+    li = _find_legs_index(inner2)
+    if li is None:
+        return []
+    legs = inner2[li]
+    out_leg = legs[0]
+    segs = [
+        [leg["from"], leg["date"], leg["to"], None, leg["airline"], leg["num"]]
+        for leg in best["legs"]
+    ]
+    d1 = best["legs"][0]["date"]
+    base = out_leg[:6]
+    tail = out_leg[-1]
+    legs[0] = [*base, d1, None, segs, None, None, None, None, None, tail]
+    inner_req = [[None, best["blob"]], inner2, 0, 0, 0, 1]
+    resp = _rpc_post(client, fsid, bl, inner_req)
+    if resp.status_code != 200:
+        return []
+    return _parse_rpc_itins(resp.text)
 
 
 def _clock(pair):
@@ -318,11 +381,11 @@ def fetch_with_retry(q, attempts=3):
             if not itins and suggestions:
                 rpc = fetch_rpc_itins(client, page)
                 if rpc:
-                    return rpc, None, suggestions
-                return [], None, suggestions
+                    return rpc, None, suggestions, client, page
+                return [], None, suggestions, client, page
             if itins:
-                return itins, None, []
-            return [], None, []
+                return itins, None, [], client, page
+            return [], None, [], client, page
         except Exception as e:
             last = f"{type(e).__name__}: {e}"
             if i < attempts - 1:
@@ -335,14 +398,14 @@ def fetch_with_retry(q, attempts=3):
                     delay,
                 )
                 time.sleep(delay)
-    return None, last, []
+    return None, last, [], None, None
 
 
 def summarize(itins):
     best = min(itins, key=lambda f: f["price"])
     detail = dict(best)
     detail["n_results"] = len(itins)
-    return float(best["price"]), json.dumps(detail, ensure_ascii=False)
+    return float(best["price"]), detail
 
 
 def key_of(kind, origin, dest, d1, d2, cfg):
@@ -458,7 +521,7 @@ def run_scan(cfg, conn, args, run_ts):
             futures.append(ex.submit(work, item))
         for fut in as_completed(futures):
             spec, key, q, out, elapsed = fut.result()
-            itins, err, suggestions = out
+            itins, err, suggestions, client, page = out
             fetched = now_iso()
             price = None
             detail = None
@@ -466,6 +529,19 @@ def run_scan(cfg, conn, args, run_ts):
             if itins:
                 price, detail = summarize(itins)
                 n_results = len(itins)
+                if spec[0] == "RT" and client is not None:
+                    try:
+                        rets = fetch_return_legs(client, page, detail)
+                        if rets:
+                            best_ret = min(rets, key=lambda r: r["price"])
+                            detail["ret"] = {
+                                k: v
+                                for k, v in best_ret.items()
+                                if k not in ("blob", "legs")
+                            }
+                    except Exception as e:
+                        log.warning("return-leg fetch failed for %s: %s", key, e)
+                detail = json.dumps(detail, ensure_ascii=False)
             elif err is None:
                 detail = json.dumps(
                     {"no_exact_results": True, "suggestions": suggestions},
@@ -635,11 +711,15 @@ def build_itineraries(cfg, rows):
                     rt = rows.get(("RT", origin, dest, d1s, d2s))
                     if rt:
                         tr_total, tr_items = transfers_for("RT", origin, dest, cfg)
-                        ow_ref = rows.get(("OW", dest, origin, d2s, ""))
                         ret_detail = None
-                        if ow_ref:
-                            ret_detail = dict(ow_ref)
-                            ret_detail["is_reference"] = True
+                        if isinstance(rt.get("ret"), dict):
+                            ret_detail = dict(rt["ret"])
+                            ret_detail["ret_real"] = True
+                        else:
+                            ow_ref = rows.get(("OW", dest, origin, d2s, ""))
+                            if ow_ref:
+                                ret_detail = dict(ow_ref)
+                                ret_detail["is_reference"] = True
                         itins.append(
                             {
                                 "key": f"RT|{origin}|{dest}|{d1s}|{d2s}",
@@ -760,6 +840,11 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
             f"{ref_txt}</td>"
         )
 
+    def slim(d):
+        if not isinstance(d, dict):
+            return d
+        return {k: v for k, v in d.items() if k not in ("blob", "legs")}
+
     rows_html = []
     shown_json = []
     for i, it in enumerate(shown, 1):
@@ -820,8 +905,8 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
                 "prev_total": prev.get(it["key"]),
                 "transfer_items": it["transfer_items"],
                 "gf_links": gf_links,
-                "out": o,
-                "ret": r,
+                "out": slim(o),
+                "ret": slim(r),
                 "ret_unavailable": it.get("ret_unavailable", False),
             }
         )
@@ -1058,9 +1143,9 @@ __ROWS__
  <p class="foot">Prices per person, 1-adult query, checked bag included, max 2 stops.
  Open jaw = sum of two one-ways (verify the true multi-city price via the GF links).
  Times are local; (+n) = arrival n days after departure; duration includes layovers.
- For round trips the API only exposes outbound leg details; the return column shows a
- <i>reference</i> (the best one-way on the same date) &mdash; the actual return flight may
- differ, verify via the GF links.
+ For round trips the return leg is the actual flight paired with the shown outbound when
+ available (fetched via Google's selection API), otherwise a <i>reference</i> (the best
+ one-way on the same date, marked &asymp;) &mdash; verify via the GF links.
  Transfers are config estimates, added per person: open jaw = shinkansen;
  round trip = shinkansen + domestic flight; FlixBus per Vienna leg
  (shinkansen €90, domestic flight €65, FlixBus €15/direction). &Delta; vs previous run. Airport codes carry full names
@@ -1130,7 +1215,7 @@ function fdate(iso) {
 function legHtml(d, label, unavailable) {
   if (!d || (unavailable && !d.is_reference)) {
     return `<div class="dlg-leg"><h3>${label}</h3>
-      <div class="muted">Leg details are not exposed by the API for round-trip queries &mdash;
+      <div class="muted">No leg details available for this row &mdash;
       use the Google Flights link below to verify.</div></div>`;
   }
   const ref = !!d.is_reference;
