@@ -48,6 +48,11 @@ def parse_args():
     )
     p.add_argument("--config", default=str(BASE / "config.toml"))
     p.add_argument(
+        "--db",
+        default=None,
+        help="override cache db path (repo flights.db is CI-owned)",
+    )
+    p.add_argument(
         "--force", action="store_true", help="ignore cache TTL, refetch everything"
     )
     p.add_argument(
@@ -62,7 +67,7 @@ def parse_args():
         help="skip fetching, rebuild ranking + HTML from cache",
     )
     p.add_argument("--verbose", action="store_true", help="debug logging")
-    p.add_argument("--out", default=str(BASE / "results.html"))
+    p.add_argument("--out", default=str(BASE / "results_local.html"))
     return p.parse_args()
 
 
@@ -1065,6 +1070,8 @@ def main():
     setup_logging(args.verbose)
     started = time.time()
     cfg = load_config(args.config)
+    if args.db:
+        cfg["cache"]["db"] = args.db
     conn = init_db(cfg["cache"]["db"])
     run_ts = now_iso()
 

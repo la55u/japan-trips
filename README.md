@@ -36,19 +36,32 @@ python3 -m venv venv
 ## Usage
 
 ```bash
-./venv/bin/python flight_search.py             # full scan (~1600 queries, ~1h at 2 workers)
-./venv/bin/python flight_search.py --limit 50  # partial run (first 50 uncached queries)
-./venv/bin/python flight_search.py --rank-only # rebuild ranking + results.html from cache
-./venv/bin/python flight_search.py --force     # ignore cache TTL, refetch everything
+./venv/bin/python flight_search.py              # full scan into flights_local.db + results_local.html
+./venv/bin/python flight_search.py --limit 50   # partial run (first 50 stale queries)
+./venv/bin/python flight_search.py --rank-only  # rebuild ranking + HTML from local cache
+./venv/bin/python flight_search.py --force      # ignore cache TTL, refetch everything
 ```
 
-Useful flags: `--workers N`, `--step N` (scan every Nth day), `--top N`, `--out FILE`,
-`--config FILE`.
+Useful flags: `--workers N`, `--step N` (scan every Nth day), `--top N`, `--db FILE`,
+`--out FILE`, `--config FILE`, `--verbose` (debug logging).
 
-Run it a few times a day; results.html and the price-history charts accumulate across
-runs, with ▲/▼ deltas vs the previous run. Every query result is committed to
-`flights.db` as soon as it arrives, so a run can be interrupted at any point without
-losing progress — the next run only fetches what's still missing or stale.
+## Local vs CI data (important)
+
+There are two independent data stores so local runs and scheduled CI scans can never
+overwrite each other's price history:
+
+| | DB | Report | Committed to git |
+|---|---|---|---|
+| **CI (GitHub Actions, 4×/day)** | `flights.db` | `results.html` → GitHub Pages | yes |
+| **Local runs (default)** | `flights_local.db` | `results_local.html` | no (gitignored) |
+
+Local runs never touch `flights.db`/`results.html`, and the CI workflow explicitly
+passes `--db flights.db --out results.html`, so neither side can clobber the other.
+Local history and the site's history diverge — that's by design.
+
+If you deliberately want a local scan to feed the live site, opt in with
+`--db flights.db --out results.html`, then `git pull --rebase` immediately after and
+push promptly (the DB is a binary file and cannot merge).
 
 ## Output (`results.html`)
 
@@ -62,9 +75,9 @@ losing progress — the next run only fetches what's still missing or stale.
   durations, itemized cost breakdown, and Google Flights links.
 - Two Chart.js charts: per-itinerary price history and cheapest-overall-per-run trend.
 
-## Caching & history (`flights.db`, SQLite)
+## Caching & history (SQLite)
 
-Every query result is cached with a TTL (default 4 h, see `[cache]`) and every price is
+Every query result is cached with a TTL (see `[cache]`) and every price is
 logged to history tables, so repeated runs are fast and deltas/graphs build over time.
 Failed or empty queries are retried (3×, with backoff) and refetched on the next run.
 
@@ -84,25 +97,28 @@ Failed or empty queries are retried (3×, with backoff) and refetched on the nex
 
 The `.github/workflows/scan.yml` workflow runs 4×/day (05:00, 11:00, 17:00, 23:00
 Budapest time; GitHub may delay scheduled runs by some minutes). Each run fetches the
-next 400 stale queries (`--limit 400`, cache TTL 24 h), so the whole scan window is
-refreshed roughly once a day while the page updates 4×/day. After scanning, the
-workflow commits `results.html` and `flights.db` back to `main`, and GitHub Pages
-redeploys automatically. `flights.db` is committed so price history and deltas
-accumulate across runs. Manual runs: *Actions → scan → Run workflow*.
+next 400 stale queries (`--limit 400 --db flights.db`, cache TTL 24 h), so the whole
+scan window is refreshed roughly once a day while the page updates 4×/day. After
+scanning, the workflow commits `results.html` and `flights.db` back to `main`, and
+GitHub Pages redeploys automatically. `flights.db` is committed so price history and
+deltas accumulate across runs; it is written **only by CI** (see "Local vs CI data").
+Manual runs: *Actions → scan → Run workflow*.
 
 ## Files
 
 - `flight_search.py` — search, ranking, HTML generation (single file).
 - `config.toml` — all settings.
-- `flights.db` — SQLite cache + price history (created at first run, gitignored).
-- `results.html` — generated report.
+- `flights.db` — CI-owned SQLite cache + price history (committed).
+- `results.html` — generated report deployed via GitHub Pages.
+- `flights_local.db`, `results_local.html` — local-run outputs (gitignored).
 
 ## GitHub Pages
 
 The report is published at https://la55u.github.io/japan-trips/ (served from the
-`main` branch root; `index.html` redirects to `results.html`). To update the live
-page after a run:
+`main` branch root; `index.html` redirects to `results.html`). The page is refreshed
+automatically by the scheduled workflow; after a deliberate local scan against the
+repo DB, push as described in "Local vs CI data":
 
 ```bash
-git add results.html && git commit -m "update results" && git push
+git add results.html flights.db && git commit -m "scan: update results" && git push
 ```

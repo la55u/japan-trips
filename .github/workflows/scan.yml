@@ -28,7 +28,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Scan next batch of stale queries
-        run: python flight_search.py --limit 400
+        run: python flight_search.py --limit 400 --db flights.db --out results.html
 
       - name: Commit updated results and cache
         run: |
