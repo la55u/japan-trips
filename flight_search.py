@@ -1179,7 +1179,7 @@ function showDetails(it) {
     ${legHtml(it.out, 'Outbound')}
     ${legHtml(it.ret, 'Return', it.ret_unavailable)}
     <table class="dlg-costs">
-      ${rows}
+      ${costs}
       <tr class="grand"><td>Total per person</td><td class="grand">${fmt(it.total)}</td></tr>
     </table>
     <div>${delta}</div>
