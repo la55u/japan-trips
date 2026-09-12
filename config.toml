@@ -1,0 +1,29 @@
+# --- search scope ---
+[search]
+origins = ["BUD", "VIE"]
+destinations = ["TYO", "OSA"]
+date_start = "2027-03-25"
+date_end = "2027-05-31"
+trip_min_days = 12
+trip_max_days = 16
+max_stops = 2
+checked_bags = 1
+step_days = 1
+
+# --- estimated transfer costs, per person, EUR ---
+[costs]
+shinkansen_eur = 90.0      # Tokyo <-> Osaka, Nozomi reserved seat
+domestic_flight_eur = 65.0 # Tokyo <-> Osaka LCC one-way
+flixbus_eur = 15.0         # Budapest <-> Vienna, per direction
+
+[currency]
+huf_per_eur = 395.0
+
+[cache]
+db = "flights.db"
+ttl_hours = 4
+
+[scan]
+workers = 2
+top_n = 40
+history_top_n = 6

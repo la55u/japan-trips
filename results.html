@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>BUD/VIE -&gt; Japan flight deals</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<style>
+ body { font-family: system-ui, sans-serif; margin: 24px; background: #fafafa; color: #222; }
+ h1 { font-size: 1.4rem; } .meta { color: #666; font-size: .85rem; }
+ .cards { display: flex; gap: 16px; margin: 16px 0; flex-wrap: wrap; }
+ .card { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 12px 20px; }
+ .card-label { font-size: .8rem; color: #666; }
+ .card-value { font-size: 1.6rem; font-weight: 600; }
+ .card-sub { font-size: .8rem; color: #444; max-width: 260px; }
+ table { border-collapse: collapse; background: #fff; font-size: .85rem; width: 100%; }
+ th, td { border: 1px solid #e0e0e0; padding: 6px 8px; text-align: left; vertical-align: top; }
+ th { cursor: pointer; background: #f0f0f0; user-select: none; white-space: nowrap; }
+ td.total { font-weight: 700; }
+ .down { color: #1a7f37; font-weight: 600; } .up { color: #c62828; font-weight: 600; }
+ .ind { color: #1a56db; font-size: .7rem; }
+ .toggle button { margin-right: 6px; padding: 4px 14px; cursor: pointer; }
+ .toggle button.active { background: #222; color: #fff; border-color: #222; }
+ .charts { display: flex; gap: 24px; flex-wrap: wrap; margin-top: 24px; }
+ .chart-box { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 12px; width: 560px; max-width: 100%; }
+ small { color: #666; }
+ a { color: #1a56db; }
+</style>
+</head>
+<body>
+<h1>BUD/VIE &harr; Tokyo/Osaka deals &mdash; 12&ndash;16 days, 2027-03-25 &rarr; 2027-05-31</h1>
+<div class="meta">Generated 2026-09-12T18:04:44Z · per-person prices · prev run: 2026-09-12T18:04:26Z · transfers: shinkansen 90 + domestic 65 + FlixBus 15 EUR/direction</div>
+<div class="toggle" style="margin:12px 0">
+ <button id="btn-eur" class="active" onclick="setCur('EUR')">EUR</button>
+ <button id="btn-huf" onclick="setCur('HUF')">HUF</button>
+</div>
+<div class="cards"><div class="card"><div class="card-label">Cheapest overall</div><div class="card-value" data-eur="1350">1350 EUR</div><div class="card-sub">Round trip BUD→TYO (via TYO/TYO) 2027-03-25 → 2027-04-07</div></div><div class="card"><div class="card-label">Cheapest round trip</div><div class="card-value" data-eur="1350">1350 EUR</div><div class="card-sub">Round trip BUD→TYO (via TYO/TYO) 2027-03-25 → 2027-04-07</div></div><div class="card"><div class="card-label">Cheapest open jaw</div><div class="card-value">no data yet</div></div></div>
+<table id="tbl">
+<thead><tr>
+ <th data-k="0">#</th><th data-k="1">Type</th><th data-k="2">Route</th>
+ <th data-k="3">Outbound</th><th data-k="4">Return</th><th data-k="5">Days</th>
+ <th data-k="6">Outbound leg</th><th data-k="7">Return leg</th>
+ <th data-k="8">Airfare</th><th data-k="9">Transfers</th><th data-k="10">Total</th>
+ <th data-k="11">&Delta;</th><th>Links</th>
+</tr></thead>
+<tbody>
+<tr data-eur-total="1350.00"><td>1</td><td>Round trip</td><td>BUD → TYO · TYO → TYO</td><td>Thu 25 Mar 2027</td><td>Wed 07 Apr 2027</td><td>13</td><td><span title="Budapest Ferenc Liszt International Airport">BUD</span> → <span title="Incheon International Airport">ICN</span> → <span title="Haneda Airport">HND</span> (1 stop)<br><small>19:30 → 22:50 (+1) · 19.3h</small><br><small>Korean Air</small></td><td><small>return leg details not exposed by API</small><br><small>Korean Air</small></td><td data-eur="1195">1195</td><td data-eur="155" title="Shinkansen + domestic flight (155)">155</td><td data-eur="1350" class="total">1350</td><td></td><td><a href="https://www.google.com/travel/flights/search?tfs=GhwSCjIwMjctMDMtMjUoAmoFEgNCVURyBRIDVFlPGhwSCjIwMjctMDQtMDcoAmoFEgNUWU9yBRIDQlVEQgEBSAFqBBAAGAGYAQE=&hl=en&curr=EUR" target="_blank" rel="noopener">GF1</a></td></tr>
+<tr data-eur-total="1350.00"><td>2</td><td>Round trip</td><td>BUD → TYO · TYO → TYO</td><td>Thu 25 Mar 2027</td><td>Thu 08 Apr 2027</td><td>14</td><td><span title="Budapest Ferenc Liszt International Airport">BUD</span> → <span title="Incheon International Airport">ICN</span> → <span title="Narita International Airport">NRT</span> (1 stop)<br><small>19:30 → 17:55 (+1) · 14.4h</small><br><small>Korean Air, Asiana Airlines</small></td><td><small>return leg details not exposed by API</small><br><small>Korean Air, Asiana Airlines</small></td><td data-eur="1195">1195</td><td data-eur="155" title="Shinkansen + domestic flight (155)">155</td><td data-eur="1350" class="total">1350</td><td></td><td><a href="https://www.google.com/travel/flights/search?tfs=GhwSCjIwMjctMDMtMjUoAmoFEgNCVURyBRIDVFlPGhwSCjIwMjctMDQtMDgoAmoFEgNUWU9yBRIDQlVEQgEBSAFqBBAAGAGYAQE=&hl=en&curr=EUR" target="_blank" rel="noopener">GF1</a></td></tr>
+<tr data-eur-total="1350.00"><td>3</td><td>Round trip</td><td>BUD → TYO · TYO → TYO</td><td>Sat 27 Mar 2027</td><td>Thu 08 Apr 2027</td><td>12</td><td><span title="Budapest Ferenc Liszt International Airport">BUD</span> → <span title="Incheon International Airport">ICN</span> → <span title="Narita International Airport">NRT</span> (1 stop)<br><small>19:30 → 12:40 (+2) · 33.2h</small><br><small>Korean Air</small></td><td><small>return leg details not exposed by API</small><br><small>Korean Air</small></td><td data-eur="1195">1195</td><td data-eur="155" title="Shinkansen + domestic flight (155)">155</td><td data-eur="1350" class="total">1350</td><td></td><td><a href="https://www.google.com/travel/flights/search?tfs=GhwSCjIwMjctMDMtMjcoAmoFEgNCVURyBRIDVFlPGhwSCjIwMjctMDQtMDgoAmoFEgNUWU9yBRIDQlVEQgEBSAFqBBAAGAGYAQE=&hl=en&curr=EUR" target="_blank" rel="noopener">GF1</a></td></tr>
+<tr data-eur-total="1350.00"><td>4</td><td>Round trip</td><td>BUD → TYO · TYO → TYO</td><td>Sat 27 Mar 2027</td><td>Fri 09 Apr 2027</td><td>13</td><td><span title="Budapest Ferenc Liszt International Airport">BUD</span> → <span title="Incheon International Airport">ICN</span> → <span title="Narita International Airport">NRT</span> (1 stop)<br><small>19:30 → 12:40 (+2) · 33.2h</small><br><small>Korean Air</small></td><td><small>return leg details not exposed by API</small><br><small>Korean Air</small></td><td data-eur="1195">1195</td><td data-eur="155" title="Shinkansen + domestic flight (155)">155</td><td data-eur="1350" class="total">1350</td><td></td><td><a href="https://www.google.com/travel/flights/search?tfs=GhwSCjIwMjctMDMtMjcoAmoFEgNCVURyBRIDVFlPGhwSCjIwMjctMDQtMDkoAmoFEgNUWU9yBRIDQlVEQgEBSAFqBBAAGAGYAQE=&hl=en&curr=EUR" target="_blank" rel="noopener">GF1</a></td></tr>
+<tr data-eur-total="1350.00"><td>5</td><td>Round trip</td><td>BUD → TYO · TYO → TYO</td><td>Sat 27 Mar 2027</td><td>Sat 10 Apr 2027</td><td>14</td><td><span title="Budapest Ferenc Liszt International Airport">BUD</span> → <span title="Incheon International Airport">ICN</span> → <span title="Narita International Airport">NRT</span> (1 stop)<br><small>19:30 → 12:40 (+2) · 33.2h</small><br><small>Korean Air</small></td><td><small>return leg details not exposed by API</small><br><small>Korean Air</small></td><td data-eur="1195">1195</td><td data-eur="155" title="Shinkansen + domestic flight (155)">155</td><td data-eur="1350" class="total">1350</td><td></td><td><a href="https://www.google.com/travel/flights/search?tfs=GhwSCjIwMjctMDMtMjcoAmoFEgNCVURyBRIDVFlPGhwSCjIwMjctMDQtMTAoAmoFEgNUWU9yBRIDQlVEQgEBSAFqBBAAGAGYAQE=&hl=en&curr=EUR" target="_blank" rel="noopener">GF1</a></td></tr>
+<tr data-eur-total="1350.00"><td>6</td><td>Round trip</td><td>BUD → TYO · TYO → TYO</td><td>Sat 27 Mar 2027</td><td>Sun 11 Apr 2027</td><td>15</td><td><span title="Budapest Ferenc Liszt International Airport">BUD</span> → <span title="Incheon International Airport">ICN</span> → <span title="Narita International Airport">NRT</span> (1 stop)<br><small>19:30 → 12:40 (+2) · 33.2h</small><br><small>Korean Air</small></td><td><small>return leg details not exposed by API</small><br><small>Korean Air</small></td><td data-eur="1195">1195</td><td data-eur="155" title="Shinkansen + domestic flight (155)">155</td><td data-eur="1350" class="total">1350</td><td></td><td><a href="https://www.google.com/travel/flights/search?tfs=GhwSCjIwMjctMDMtMjcoAmoFEgNCVURyBRIDVFlPGhwSCjIwMjctMDQtMTEoAmoFEgNUWU9yBRIDQlVEQgEBSAFqBBAAGAGYAQE=&hl=en&curr=EUR" target="_blank" rel="noopener">GF1</a></td></tr>
+<tr data-eur-total="1362.00"><td>7</td><td>Round trip</td><td>BUD → OSA · OSA → OSA</td><td>Thu 25 Mar 2027</td><td>Tue 06 Apr 2027</td><td>12</td><td><span title="BUD">BUD</span> → <span title="ICN">ICN</span> → <span title="KIX">KIX</span> (1 stop)<br><small></small><br><small>Asiana Airlines, Korean Air</small></td><td><small>return leg details not exposed by API</small><br><small>Asiana Airlines, Korean Air</small></td><td data-eur="1207">1207</td><td data-eur="155" title="Shinkansen + domestic flight (155)">155</td><td data-eur="1362" class="total">1362</td><td></td><td><a href="https://www.google.com/travel/flights/search?tfs=GhwSCjIwMjctMDMtMjUoAmoFEgNCVURyBRIDT1NBGhwSCjIwMjctMDQtMDYoAmoFEgNPU0FyBRIDQlVEQgEBSAFqBBAAGAGYAQE=&hl=en&curr=EUR" target="_blank" rel="noopener">GF1</a></td></tr>
+<tr data-eur-total="1369.00"><td>8</td><td>Round trip</td><td>BUD → TYO · TYO → TYO</td><td>Thu 25 Mar 2027</td><td>Sat 10 Apr 2027</td><td>16</td><td><span title="Budapest Ferenc Liszt International Airport">BUD</span> → <span title="Incheon International Airport">ICN</span> → <span title="Haneda Airport">HND</span> (1 stop)<br><small>19:30 → 21:35 (+1) · 18.1h</small><br><small>Korean Air</small></td><td><small>return leg details not exposed by API</small><br><small>Korean Air</small></td><td data-eur="1214">1214</td><td data-eur="155" title="Shinkansen + domestic flight (155)">155</td><td data-eur="1369" class="total">1369</td><td></td><td><a href="https://www.google.com/travel/flights/search?tfs=GhwSCjIwMjctMDMtMjUoAmoFEgNCVURyBRIDVFlPGhwSCjIwMjctMDQtMTAoAmoFEgNUWU9yBRIDQlVEQgEBSAFqBBAAGAGYAQE=&hl=en&curr=EUR" target="_blank" rel="noopener">GF1</a></td></tr>
+<tr data-eur-total="1377.00"><td>9</td><td>Round trip</td><td>BUD → TYO · TYO → TYO</td><td>Thu 25 Mar 2027</td><td>Fri 09 Apr 2027</td><td>15</td><td><span title="Budapest Ferenc Liszt International Airport">BUD</span> → <span title="Incheon International Airport">ICN</span> → <span title="Haneda Airport">HND</span> (1 stop)<br><small>19:30 → 21:35 (+1) · 18.1h</small><br><small>Korean Air</small></td><td><small>return leg details not exposed by API</small><br><small>Korean Air</small></td><td data-eur="1222">1222</td><td data-eur="155" title="Shinkansen + domestic flight (155)">155</td><td data-eur="1377" class="total">1377</td><td></td><td><a href="https://www.google.com/travel/flights/search?tfs=GhwSCjIwMjctMDMtMjUoAmoFEgNCVURyBRIDVFlPGhwSCjIwMjctMDQtMDkoAmoFEgNUWU9yBRIDQlVEQgEBSAFqBBAAGAGYAQE=&hl=en&curr=EUR" target="_blank" rel="noopener">GF1</a></td></tr>
+<tr data-eur-total="1434.00"><td>10</td><td>Round trip</td><td>BUD → TYO · TYO → TYO</td><td>Sat 27 Mar 2027</td><td>Mon 12 Apr 2027</td><td>16</td><td><span title="Budapest Ferenc Liszt International Airport">BUD</span> → <span title="Helsinki Airport">HEL</span> → <span title="Narita International Airport">NRT</span> (1 stop)<br><small>19:15 → 13:05 (+2) · 34.8h</small><br><small>Finnair</small></td><td><small>return leg details not exposed by API</small><br><small>Finnair</small></td><td data-eur="1279">1279</td><td data-eur="155" title="Shinkansen + domestic flight (155)">155</td><td data-eur="1434" class="total">1434</td><td></td><td><a href="https://www.google.com/travel/flights/search?tfs=GhwSCjIwMjctMDMtMjcoAmoFEgNCVURyBRIDVFlPGhwSCjIwMjctMDQtMTIoAmoFEgNUWU9yBRIDQlVEQgEBSAFqBBAAGAGYAQE=&hl=en&curr=EUR" target="_blank" rel="noopener">GF1</a></td></tr>
+<tr data-eur-total="1568.00"><td>11</td><td>Round trip</td><td>BUD → TYO · TYO → TYO</td><td>Thu 25 Mar 2027</td><td>Tue 06 Apr 2027</td><td>12</td><td><span title="Budapest Ferenc Liszt International Airport">BUD</span> → <span title="Helsinki Airport">HEL</span> → <span title="Narita International Airport">NRT</span> (1 stop)<br><small>11:35 → 14:10 (+2) · 42.6h</small><br><small>Finnair</small></td><td><small>return leg details not exposed by API</small><br><small>Finnair</small></td><td data-eur="1413">1413</td><td data-eur="155" title="Shinkansen + domestic flight (155)">155</td><td data-eur="1568" class="total">1568</td><td></td><td><a href="https://www.google.com/travel/flights/search?tfs=GhwSCjIwMjctMDMtMjUoAmoFEgNCVURyBRIDVFlPGhwSCjIwMjctMDQtMDYoAmoFEgNUWU9yBRIDQlVEQgEBSAFqBBAAGAGYAQE=&hl=en&curr=EUR" target="_blank" rel="noopener">GF1</a></td></tr>
+<tr data-eur-total="1669.00"><td>12</td><td>Round trip</td><td>BUD → TYO · TYO → TYO</td><td>Fri 26 Mar 2027</td><td>Wed 07 Apr 2027</td><td>12</td><td><span title="Budapest Ferenc Liszt International Airport">BUD</span> → <span title="Heathrow Airport">LHR</span> → <span title="Incheon International Airport">ICN</span> → <span title="Narita International Airport">NRT</span> (2 stops)<br><small>11:55 → 20:20 (+1) · 24.4h</small><br><small>British Airways, Asiana Airlines</small></td><td><small>return leg details not exposed by API</small><br><small>British Airways, Asiana Airlines</small></td><td data-eur="1514">1514</td><td data-eur="155" title="Shinkansen + domestic flight (155)">155</td><td data-eur="1669" class="total">1669</td><td></td><td><a href="https://www.google.com/travel/flights/search?tfs=GhwSCjIwMjctMDMtMjYoAmoFEgNCVURyBRIDVFlPGhwSCjIwMjctMDQtMDcoAmoFEgNUWU9yBRIDQlVEQgEBSAFqBBAAGAGYAQE=&hl=en&curr=EUR" target="_blank" rel="noopener">GF1</a></td></tr>
+<tr data-eur-total="1724.00"><td>13</td><td>Round trip</td><td>BUD → TYO · TYO → TYO</td><td>Fri 26 Mar 2027</td><td>Fri 09 Apr 2027</td><td>14</td><td><span title="Budapest Ferenc Liszt International Airport">BUD</span> → <span title="Heathrow Airport">LHR</span> → <span title="Incheon International Airport">ICN</span> → <span title="Haneda Airport">HND</span> (2 stops)<br><small>11:55 → 23:25 (+1) · 27.5h</small><br><small>British Airways, Asiana Airlines</small></td><td><small>return leg details not exposed by API</small><br><small>British Airways, Asiana Airlines</small></td><td data-eur="1569">1569</td><td data-eur="155" title="Shinkansen + domestic flight (155)">155</td><td data-eur="1724" class="total">1724</td><td></td><td><a href="https://www.google.com/travel/flights/search?tfs=GhwSCjIwMjctMDMtMjYoAmoFEgNCVURyBRIDVFlPGhwSCjIwMjctMDQtMDkoAmoFEgNUWU9yBRIDQlVEQgEBSAFqBBAAGAGYAQE=&hl=en&curr=EUR" target="_blank" rel="noopener">GF1</a></td></tr>
+<tr data-eur-total="1724.00"><td>14</td><td>Round trip</td><td>BUD → TYO · TYO → TYO</td><td>Fri 26 Mar 2027</td><td>Sun 11 Apr 2027</td><td>16</td><td><span title="Budapest Ferenc Liszt International Airport">BUD</span> → <span title="Heathrow Airport">LHR</span> → <span title="Incheon International Airport">ICN</span> → <span title="Haneda Airport">HND</span> (2 stops)<br><small>11:55 → 23:25 (+1) · 27.5h</small><br><small>British Airways, Asiana Airlines</small></td><td><small>return leg details not exposed by API</small><br><small>British Airways, Asiana Airlines</small></td><td data-eur="1569">1569</td><td data-eur="155" title="Shinkansen + domestic flight (155)">155</td><td data-eur="1724" class="total">1724</td><td></td><td><a href="https://www.google.com/travel/flights/search?tfs=GhwSCjIwMjctMDMtMjYoAmoFEgNCVURyBRIDVFlPGhwSCjIwMjctMDQtMTEoAmoFEgNUWU9yBRIDQlVEQgEBSAFqBBAAGAGYAQE=&hl=en&curr=EUR" target="_blank" rel="noopener">GF1</a></td></tr>
+<tr data-eur-total="1739.00"><td>15</td><td>Round trip</td><td>BUD → TYO · TYO → TYO</td><td>Fri 26 Mar 2027</td><td>Sat 10 Apr 2027</td><td>15</td><td><span title="Budapest Ferenc Liszt International Airport">BUD</span> → <span title="Hamad International Airport">DOH</span> → <span title="Narita International Airport">NRT</span> (1 stop)<br><small>09:20 → 17:55 (+1) · 24.6h</small><br><small>Qatar Airways</small></td><td><small>return leg details not exposed by API</small><br><small>Qatar Airways</small></td><td data-eur="1584">1584</td><td data-eur="155" title="Shinkansen + domestic flight (155)">155</td><td data-eur="1739" class="total">1739</td><td></td><td><a href="https://www.google.com/travel/flights/search?tfs=GhwSCjIwMjctMDMtMjYoAmoFEgNCVURyBRIDVFlPGhwSCjIwMjctMDQtMTAoAmoFEgNUWU9yBRIDQlVEQgEBSAFqBBAAGAGYAQE=&hl=en&curr=EUR" target="_blank" rel="noopener">GF1</a></td></tr>
+<tr data-eur-total="1743.00"><td>16</td><td>Round trip</td><td>BUD → TYO · TYO → TYO</td><td>Fri 26 Mar 2027</td><td>Thu 08 Apr 2027</td><td>13</td><td><span title="Budapest Ferenc Liszt International Airport">BUD</span> → <span title="Heathrow Airport">LHR</span> → <span title="Incheon International Airport">ICN</span> → <span title="Haneda Airport">HND</span> (2 stops)<br><small>11:55 → 23:25 (+1) · 27.5h</small><br><small>British Airways, Asiana Airlines</small></td><td><small>return leg details not exposed by API</small><br><small>British Airways, Asiana Airlines</small></td><td data-eur="1588">1588</td><td data-eur="155" title="Shinkansen + domestic flight (155)">155</td><td data-eur="1743" class="total">1743</td><td></td><td><a href="https://www.google.com/travel/flights/search?tfs=GhwSCjIwMjctMDMtMjYoAmoFEgNCVURyBRIDVFlPGhwSCjIwMjctMDQtMDgoAmoFEgNUWU9yBRIDQlVEQgEBSAFqBBAAGAGYAQE=&hl=en&curr=EUR" target="_blank" rel="noopener">GF1</a></td></tr>
+</tbody>
+</table>
+<p><small>Prices per person in EUR, 1 adult query, checked bag included, max 2 stops.
+Open jaw = sum of two one-ways (verify multi-city on Google Flights via links).
+Times are local; (+n) = arrival n days after departure; duration includes layovers.
+For round trips the API only exposes outbound leg details (times/duration), not the return leg.
+Transfers are config estimates: open jaw = shinkansen; round trip = shinkansen + domestic flight;
+FlixBus added per Vienna leg. &Delta; vs previous run. Hover airport codes for full names.</small></p>
+<div class="charts">
+ <div class="chart-box"><h3>Top itineraries &mdash; total price over runs</h3><canvas id="c1"></canvas></div>
+ <div class="chart-box"><h3>Cheapest overall over runs</h3><canvas id="c2"></canvas></div>
+</div>
+<script>
+const HUF = 395.0;
+let cur = 'EUR';
+function fmt(v) {
+  return cur === 'EUR' ? Math.round(v).toLocaleString('en') + ' €'
+    : Math.round(v * HUF).toLocaleString('hu') + ' Ft';
+}
+function apply() {
+  document.querySelectorAll('[data-eur]').forEach(el => { el.textContent = fmt(parseFloat(el.dataset.eur)); });
+  document.querySelectorAll('[data-eur-total]').forEach(el => { el.dataset.v = el.dataset.eurTotal; });
+  document.getElementById('btn-eur').classList.toggle('active', cur === 'EUR');
+  document.getElementById('btn-huf').classList.toggle('active', cur === 'HUF');
+  redrawSort();
+}
+document.querySelectorAll('#tbl th[data-k]').forEach(th => {
+  th.dataset.label = th.innerHTML;
+  th.addEventListener('click', () => sortBy(th));
+});
+let sortKey = 10, sortAsc = true;
+function redrawSort() {
+  const tb = document.querySelector('#tbl tbody');
+  const rows = [...tb.querySelectorAll('tr')];
+  rows.sort((a, b) => {
+    let va = a.children[sortKey].innerText.trim(), vb = b.children[sortKey].innerText.trim();
+    const na = parseFloat(va.replace(/[^0-9.,-]/g, '').replace(',', '')) || null;
+    const nb = parseFloat(vb.replace(/[^0-9.,-]/g, '').replace(',', '')) || null;
+    let r;
+    if (na !== null && nb !== null) r = na - nb; else r = va.localeCompare(vb);
+    return sortAsc ? r : -r;
+  });
+  rows.forEach(r => tb.appendChild(r));
+  document.querySelectorAll('#tbl th[data-k]').forEach(th => {
+    th.innerHTML = parseInt(th.dataset.k) === sortKey
+      ? th.dataset.label + ' <span class="ind">' + (sortAsc ? '▲' : '▼') + '</span>'
+      : th.dataset.label;
+  });
+}
+function sortBy(th) {
+  const k = parseInt(th.dataset.k);
+  if (sortKey === k) sortAsc = !sortAsc; else { sortKey = k; sortAsc = k === 0; }
+  redrawSort();
+}
+function setCur(c) { cur = c; apply(); }
+const chartData = {"labels": ["09-12 17:45", "09-12 17:50", "09-12 17:51", "09-12 18:03", "09-12 18:03", "09-12 18:03", "09-12 18:04", "09-12 18:04"], "datasets": [{"label": "Round trip BUD\u2192TYO (via TYO/TYO) 2027-03-25 \u2192 2027-04-07", "data": [1350.0, 1350.0, null, 1350.0, 1350.0, 1350.0, 1350.0, 1350.0], "borderColor": "#4e79a7", "backgroundColor": "#4e79a7", "spanGaps": true, "tension": 0.25, "pointRadius": 3}, {"label": "Round trip BUD\u2192TYO (via TYO/TYO) 2027-03-25 \u2192 2027-04-08", "data": [1350.0, 1350.0, null, 1350.0, 1350.0, 1350.0, 1350.0, 1350.0], "borderColor": "#f28e2b", "backgroundColor": "#f28e2b", "spanGaps": true, "tension": 0.25, "pointRadius": 3}, {"label": "Round trip BUD\u2192TYO (via TYO/TYO) 2027-03-27 \u2192 2027-04-08", "data": [null, null, null, null, 1350.0, 1350.0, 1350.0, 1350.0], "borderColor": "#e15759", "backgroundColor": "#e15759", "spanGaps": true, "tension": 0.25, "pointRadius": 3}, {"label": "Round trip BUD\u2192TYO (via TYO/TYO) 2027-03-27 \u2192 2027-04-09", "data": [null, null, null, null, 1350.0, 1350.0, 1350.0, 1350.0], "borderColor": "#76b7b2", "backgroundColor": "#76b7b2", "spanGaps": true, "tension": 0.25, "pointRadius": 3}, {"label": "Round trip BUD\u2192TYO (via TYO/TYO) 2027-03-27 \u2192 2027-04-10", "data": [null, null, null, null, 1350.0, 1350.0, 1350.0, 1350.0], "borderColor": "#59a14f", "backgroundColor": "#59a14f", "spanGaps": true, "tension": 0.25, "pointRadius": 3}, {"label": "Round trip BUD\u2192TYO (via TYO/TYO) 2027-03-27 \u2192 2027-04-11", "data": [null, null, null, null, 1350.0, 1350.0, 1350.0, 1350.0], "borderColor": "#edc948", "backgroundColor": "#edc948", "spanGaps": true, "tension": 0.25, "pointRadius": 3}]};
+const bestChart = {"labels": ["09-12 17:45", "09-12 17:50", "09-12 17:51", "09-12 18:03", "09-12 18:03", "09-12 18:03", "09-12 18:04", "09-12 18:04"], "datasets": [{"label": "Cheapest total (EUR/person)", "data": [1350.0, 1350.0, 1362.0, 1350.0, 1350.0, 1350.0, 1350.0, 1350.0], "borderColor": "#4e79a7", "spanGaps": true, "tension": 0.25}]};
+new Chart(document.getElementById('c1'), {
+  type: 'line', data: chartData,
+  options: { scales: { y: { title: { display: true, text: 'EUR/person' } } },
+             plugins: { legend: { position: 'bottom', labels: { boxWidth: 12, font: { size: 10 } } } } }
+});
+new Chart(document.getElementById('c2'), {
+  type: 'line', data: bestChart,
+  options: { plugins: { legend: { display: false } } }
+});
+apply();
+</script>
+</body>
+</html>
