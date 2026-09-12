@@ -130,7 +130,136 @@ def fetch_html(q):
         params=q.params(),
         headers={"Cookie": SOCS_COOKIE},
     )
-    return resp.text
+    return client, resp.text
+
+
+def _itinerary_from_entry(k):
+    flight = k[0]
+    p = k[1][0] if k[1] else None
+    if not isinstance(p, list) or len(p) < 2 or p[1] is None:
+        return None
+    price = float(p[1])
+    segs = []
+    airports = {}
+    for s in flight[2]:
+        seg = {
+            "from": s[3],
+            "from_name": s[4],
+            "to": s[6],
+            "to_name": s[5],
+            "dep_t": _clock(s[8]),
+            "arr_t": _clock(s[10]),
+            "dur_min": s[11],
+            "dep_d": tuple(s[20]),
+            "arr_d": tuple(s[21]),
+        }
+        airports[seg["from"]] = seg["from_name"]
+        airports[seg["to"]] = seg["to_name"]
+        segs.append(seg)
+    if not segs:
+        return None
+    airlines = [a if isinstance(a, str) else a[1] for a in (flight[1] or [])]
+    codes = [segs[0]["from"]] + [s["to"] for s in segs]
+    dep_dt = datetime(*segs[0]["dep_d"], *segs[0]["dep_t"])
+    arr_dt = datetime(*segs[-1]["arr_d"], *segs[-1]["arr_t"])
+    total_min = sum(s["dur_min"] for s in segs)
+    for a, b in zip(segs, segs[1:]):
+        lay = (
+            datetime(*b["dep_d"], *b["dep_t"]) - datetime(*a["arr_d"], *a["arr_t"])
+        ).total_seconds() / 60
+        if lay > 0:
+            total_min += lay
+    plus = (date(*segs[-1]["arr_d"]) - date(*segs[0]["dep_d"])).days
+    return {
+        "price": price,
+        "airlines": airlines,
+        "route": " -> ".join(codes),
+        "stops": len(segs) - 1,
+        "dep": dep_dt.strftime("%H:%M"),
+        "arr": arr_dt.strftime("%H:%M"),
+        "plus": plus,
+        "dur_h": round(total_min / 60, 1),
+        "airports": airports,
+    }
+
+
+RPC_PATH = (
+    "https://www.google.com/_/FlightsFrontendUi/data/"
+    "travel.frontend.flights.FlightsFrontendService/GetShoppingResults"
+)
+
+
+def fetch_rpc_itins(client, page_html):
+    """For the null-variant pages (ds:1 empty, suggestions instead of results),
+    replay the GetShoppingResults RPC the browser would issue, using the request
+    template Google embedded in the page itself."""
+    token_m = re.search(r"[A-Za-z0-9_-]{6,}-{6,}[A-Za-z0-9_-]{6,}", page_html)
+    fsid_m = re.search(r'FdrFJe":"(-?[0-9]+)', page_html)
+    bl_m = re.search(r'cfb2h":"([a-z0-9_.-]+)"', page_html)
+    req_m = re.search(r"'ds:1'\s*:\s*\{id:'[^']*',request:", page_html)
+    if not (token_m and fsid_m and bl_m and req_m):
+        return []
+    try:
+        req_json, _ = json.JSONDecoder().raw_decode(page_html, req_m.end())
+    except json.JSONDecodeError:
+        return []
+    if len(req_json) < 2:
+        return []
+    inner_req = [
+        [None, None, None, token_m.group(0)],
+        req_json[1],
+        0,
+        0,
+        0,
+        1,
+    ]
+    url = (
+        f"{RPC_PATH}?f.sid={fsid_m.group(1)}&bl={bl_m.group(1)}"
+        "&hl=en&soc-app=162&soc-platform=1&soc-device=1&_reqid=100001&rt=c"
+        "&curr=EUR"
+    )
+    body = "f.req=" + json.dumps(
+        [None, json.dumps(inner_req, separators=(",", ":"))], separators=(",", ":")
+    )
+    resp = client.post(
+        url,
+        headers={
+            "Cookie": SOCS_COOKIE,
+            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+        },
+        data=body,
+    )
+    if resp.status_code != 200:
+        return []
+    itins = []
+    seen = set()
+    for line in resp.text.split("\n"):
+        if not line.startswith("[["):
+            continue
+        try:
+            arr = json.loads(line)
+            inner = json.loads(arr[0][2])
+        except (json.JSONDecodeError, IndexError, KeyError, TypeError):
+            continue
+        for idx in (2, 3):
+            section = inner[idx] if len(inner) > idx else None
+            if not isinstance(section, list):
+                continue
+            for block in section:
+                if not isinstance(block, list) or block[0] is None:
+                    continue
+                for el in block:
+                    try:
+                        it = _itinerary_from_entry(el)
+                    except (IndexError, KeyError, TypeError):
+                        it = None
+                    if not it:
+                        continue
+                    key = (it["route"], it["dep"], it["price"])
+                    if key not in seen:
+                        seen.add(key)
+                        itins.append(it)
+    return itins
 
 
 def _clock(pair):
@@ -172,68 +301,28 @@ def parse_payload(html_text):
     itins = []
     for k in payload[3][0]:
         try:
-            flight = k[0]
-            p = k[1][0] if k[1] else None
-            if not isinstance(p, list) or len(p) < 2 or p[1] is None:
-                continue
-            price = float(p[1])
-            segs = []
-            airports = {}
-            for s in flight[2]:
-                seg = {
-                    "from": s[3],
-                    "from_name": s[4],
-                    "to": s[6],
-                    "to_name": s[5],
-                    "dep_t": _clock(s[8]),
-                    "arr_t": _clock(s[10]),
-                    "dur_min": s[11],
-                    "dep_d": tuple(s[20]),
-                    "arr_d": tuple(s[21]),
-                }
-                airports[seg["from"]] = seg["from_name"]
-                airports[seg["to"]] = seg["to_name"]
-                segs.append(seg)
-            if not segs:
-                continue
-            airlines = [a if isinstance(a, str) else a[1] for a in (flight[1] or [])]
-            codes = [segs[0]["from"]] + [s["to"] for s in segs]
-            dep_dt = datetime(*segs[0]["dep_d"], *segs[0]["dep_t"])
-            arr_dt = datetime(*segs[-1]["arr_d"], *segs[-1]["arr_t"])
-            total_min = sum(s["dur_min"] for s in segs)
-            for a, b in zip(segs, segs[1:]):
-                lay = (
-                    datetime(*b["dep_d"], *b["dep_t"])
-                    - datetime(*a["arr_d"], *a["arr_t"])
-                ).total_seconds() / 60
-                if lay > 0:
-                    total_min += lay
-            plus = (date(*segs[-1]["arr_d"]) - date(*segs[0]["dep_d"])).days
-            itins.append(
-                {
-                    "price": price,
-                    "airlines": airlines,
-                    "route": " -> ".join(codes),
-                    "stops": len(segs) - 1,
-                    "dep": dep_dt.strftime("%H:%M"),
-                    "arr": arr_dt.strftime("%H:%M"),
-                    "plus": plus,
-                    "dur_h": round(total_min / 60, 1),
-                    "airports": airports,
-                }
-            )
+            it = _itinerary_from_entry(k)
         except (IndexError, KeyError, TypeError):
-            continue
+            it = None
+        if it:
+            itins.append(it)
     return itins, suggestions
 
 
 def fetch_with_retry(q, attempts=3):
+    last = None
     for i in range(attempts):
+        client, page = fetch_html(q)
         try:
-            itins, suggestions = parse_payload(fetch_html(q))
+            itins, suggestions = parse_payload(page)
+            if not itins and suggestions:
+                rpc = fetch_rpc_itins(client, page)
+                if rpc:
+                    return rpc, None, suggestions
+                return [], None, suggestions
             if itins:
                 return itins, None, []
-            return [], None, suggestions
+            return [], None, []
         except Exception as e:
             last = f"{type(e).__name__}: {e}"
             if i < attempts - 1:
