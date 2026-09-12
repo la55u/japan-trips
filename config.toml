@@ -23,7 +23,7 @@ huf_per_eur = 395.0
 # Local runs write here (gitignored). CI scans use the repo-owned flights.db
 # via --db flights.db - keep them separate so neither overwrites the other.
 db = "flights_local.db"
-ttl_hours = 24
+ttl_hours = 12
 
 [scan]
 workers = 2

@@ -511,10 +511,15 @@ def run_scan(cfg, conn, args, run_ts):
             else:
                 consec_fail += 1
                 if consec_fail >= 5:
+                    pause = 60 * min(consec_fail - 4, 5)
                     log.warning(
-                        "%d consecutive failures - possible throttling/captcha",
+                        "%d consecutive failures - possible throttling/captcha, "
+                        "pausing all workers for %ds",
                         consec_fail,
+                        pause,
                     )
+                    time.sleep(pause)
+                    consec_fail = 0
                 log.warning(
                     "[%d/%d] %s: FAILED after retries (%s), %.1fs",
                     done,
