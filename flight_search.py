@@ -67,6 +67,11 @@ def parse_args():
         help="skip fetching, rebuild ranking + HTML from cache",
     )
     p.add_argument("--verbose", action="store_true", help="debug logging")
+    p.add_argument(
+        "--no-skyscanner",
+        action="store_true",
+        help="skip the Skyscanner spot-check this run",
+    )
     p.add_argument("--out", default=str(BASE / "results_local.html"))
     return p.parse_args()
 
@@ -102,6 +107,12 @@ def init_db(path: str) -> sqlite3.Connection:
         );
         CREATE TABLE IF NOT EXISTS state (
             key TEXT PRIMARY KEY, value TEXT
+        );
+        CREATE TABLE IF NOT EXISTS skyscanner_prices (
+            key TEXT PRIMARY KEY,
+            origin TEXT, dest TEXT, d1 TEXT, d2 TEXT,
+            total_results INTEGER, deals_json TEXT,
+            fetched_at TEXT
         );
         """
     )
@@ -298,6 +309,227 @@ def _find_legs_index(inner2):
         ):
             return i
     return None
+
+
+def _age_hours(ts):
+    if not ts:
+        return None
+    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+
+
+def _ss_url(origin, dest, d1, d2, domain):
+    fmt = lambda d: d.replace("-", "")[2:]
+    return (
+        f"https://www.{domain}/transport/flights/"
+        f"{origin.lower()}/{dest.lower()}a/{fmt(d1)}/{fmt(d2)}/"
+        "?adultsv2=1&cabinclass=economy&rtn=1"
+    )
+
+
+def _solve_px(pg):
+    cap = pg.locator("#px-captcha").first
+    cap.wait_for(timeout=10000)
+    box = cap.bounding_box()
+    x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+    pg.mouse.move(x, y)
+    pg.mouse.down()
+    for i in range(22):
+        pg.wait_for_timeout(500)
+        pg.mouse.move(x + (i % 3 - 1), y + (i % 2), steps=2)
+    pg.mouse.up()
+    pg.wait_for_timeout(8000)
+
+
+def _parse_skyscanner_payload(body, domain):
+    data = json.loads(body)
+    it = data.get("itineraries", {})
+    results = it.get("results") or []
+    agents = {a["id"]: a.get("name", a["id"]) for a in (it.get("agents") or [])}
+    deals = []
+    for r in results:
+        legs = [
+            {
+                "from": leg["origin"]["id"],
+                "to": leg["destination"]["id"],
+                "stops": leg.get("stopCount", 0),
+                "dep": leg.get("departure", "")[:16],
+                "arr": leg.get("arrival", "")[:16],
+                "carriers": [
+                    c.get("name", "")
+                    for c in leg.get("carriers", {}).get("marketing", [])
+                ],
+            }
+            for leg in (r.get("legs") or [])
+        ]
+        options = r.get("pricingOptions") or []
+        agent_ids = options[0].get("agentIds", []) if options else []
+        link = None
+        if options:
+            items = options[0].get("items") or []
+            if items and items[0].get("url"):
+                link = "https://www." + domain + items[0]["url"]
+        deals.append(
+            {
+                "price_raw": r["price"]["raw"],
+                "price_fmt": r["price"].get("formatted", ""),
+                "self_transfer": bool(r.get("isSelfTransfer")),
+                "protected": bool(r.get("isProtectedSelfTransfer")),
+                "agents": [agents.get(a, a) for a in agent_ids],
+                "legs": legs,
+                "link": link,
+            }
+        )
+    deals.sort(key=lambda d: d["price_raw"])
+    total = (it.get("context") or {}).get("totalResults", len(results))
+    return total, deals
+
+
+def skyscanner_spotcheck(cfg, conn, combos):
+    """Spot-check Skyscanner (OTA / self-transfer prices) for selected
+    route/date combos via a camoufox browser. Returns rows to store."""
+    from camoufox.sync_api import Camoufox
+
+    sk_cfg = cfg.get("skyscanner", {})
+    domain = sk_cfg.get("domain", "skyscanner.hu")
+    rows = []
+    with Camoufox(
+        headless=True, humanize=True, geoip=True, locale=["hu-HU"]
+    ) as browser:
+        pg = browser.new_page()
+        captured = []
+
+        def _capture(r):
+            try:
+                if "web-unified-search" in r.url and r.status == 200:
+                    body = r.text()
+                    if len(body) > 100000:
+                        captured.append(body)
+            except Exception:
+                pass
+
+        pg.on("response", _capture)
+        for origin, dest, d1, d2 in combos:
+            url = _ss_url(origin, dest, d1, d2, domain)
+            captured.clear()
+            try:
+                pg.goto(url, timeout=90000, wait_until="domcontentloaded")
+                pg.wait_for_timeout(8000)
+                if pg.locator("#px-captcha").count():
+                    _solve_px(pg)
+                    pg.goto(url, timeout=90000, wait_until="domcontentloaded")
+                for attempt in range(12):
+                    pg.wait_for_timeout(5000)
+                    if captured:
+                        break
+                if captured:
+                    best_body = max(captured, key=len)
+                    total, deals = _parse_skyscanner_payload(best_body, domain)
+                    rows.append((origin, dest, d1, d2, total, deals))
+                    log.info(
+                        "skyscanner %s->%s %s..%s: %d results, top %s",
+                        origin,
+                        dest,
+                        d1,
+                        d2,
+                        total,
+                        f"{deals[0]['price_fmt']} ({deals[0]['agents'][0] if deals[0]['agents'] else '?'})"
+                        if deals
+                        else "none",
+                    )
+                else:
+                    log.warning(
+                        "skyscanner %s->%s %s..%s: no results captured",
+                        origin,
+                        dest,
+                        d1,
+                        d2,
+                    )
+            except Exception as e:
+                log.warning("skyscanner %s->%s failed: %s", origin, dest, str(e)[:120])
+            time.sleep(random.uniform(5, 10))
+    return rows
+
+
+def _ss_eur(price_raw, price_fmt, huf_per_eur, gbp_per_eur):
+    if "Ft" in price_fmt:
+        return price_raw / huf_per_eur
+    if "£" in price_fmt:
+        return price_raw / gbp_per_eur
+    return price_raw
+
+
+def run_skyscanner_if_due(cfg, conn, args, itins):
+    """Run the Skyscanner spot-check when due; store results in the DB."""
+    sk_cfg = cfg.get("skyscanner", {})
+    if not sk_cfg.get("enabled", False):
+        return
+    if args.no_skyscanner or getattr(args, "rank_only", False):
+        return
+    last = conn.execute(
+        "SELECT value FROM state WHERE key='skyscanner_last_run'"
+    ).fetchone()
+    if last:
+        age = _age_hours(last[0])
+        if age is not None and age < sk_cfg.get("min_age_hours", 20):
+            log.info(
+                "skyscanner spot-check skipped (last run %.1fh ago, min %dh)",
+                age,
+                sk_cfg.get("min_age_hours", 20),
+            )
+            return
+    seen = set()
+    combos = []
+    for it in itins:
+        key = (it["out_origin"], it["in_city"], it["d1"], it["d2"])
+        if key in seen:
+            continue
+        seen.add(key)
+        combos.append((it["out_origin"], it["in_city"], it["d1"], it["d2"]))
+        if len(combos) >= sk_cfg.get("combos", 6):
+            break
+    if not combos:
+        return
+    log.info("skyscanner spot-check starting for %d combos", len(combos))
+    try:
+        rows = skyscanner_spotcheck(cfg, conn, combos)
+    except Exception as e:
+        log.warning("skyscanner spot-check failed entirely: %s", str(e)[:200])
+        return
+    now = now_iso()
+    top_deals = sk_cfg.get("top_deals", 10)
+    huf = cfg["currency"]["huf_per_eur"]
+    gbp = cfg["currency"].get("gbp_per_eur", 1.17)
+    for origin, dest, d1, d2, total, deals in rows:
+        slim = []
+        for d in deals[: sk_cfg.get("top_deals", 10)]:
+            d = dict(d)
+            d["eur"] = round(_ss_eur(d["price_raw"], d["price_fmt"], huf, gbp), 0)
+            slim.append(d)
+        key = f"{origin}|{dest}|{d1}|{d2}"
+        conn.execute(
+            "INSERT INTO skyscanner_prices (key, origin, dest, d1, d2, total_results, deals_json, fetched_at)"
+            " VALUES (?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(key) DO UPDATE SET total_results=excluded.total_results,"
+            " deals_json=excluded.deals_json, fetched_at=excluded.fetched_at",
+            (
+                key,
+                origin,
+                dest,
+                d1,
+                d2,
+                total,
+                json.dumps(slim, ensure_ascii=False),
+                now_iso(),
+            ),
+        )
+    conn.execute(
+        "INSERT INTO state (key, value) VALUES ('skyscanner_last_run', ?)"
+        " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (now_iso(),),
+    )
+    conn.commit()
+    log.info("skyscanner spot-check stored %d combos", len(rows))
 
 
 def fetch_return_legs(client, page_html, best):
@@ -832,6 +1064,13 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
             f'<div class="card-sub">{html.escape(it["label"])}</div></div>'
         )
 
+    def _dur_cls(h):
+        if h <= 20:
+            return "dur-ok"
+        if h <= 24:
+            return "dur-mid"
+        return "dur-bad"
+
     def leg_cell(d, unavailable=False):
         if not d:
             return "<td>—</td>"
@@ -849,11 +1088,11 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
         )
         times = ""
         if d.get("dep"):
-            times = f"{d['dep']} → {d['arr']}"
+            times = f"{html.escape(d['dep'])} → {html.escape(d['arr'])}"
             if d.get("plus"):
                 times += f" (+{d['plus']})"
             if d.get("dur_h"):
-                times += f" · {d['dur_h']}h"
+                times += f' · <span class="{_dur_cls(d["dur_h"])}">{d["dur_h"]}h</span>'
         stops = d.get("stops")
         stops_txt = f" ({stops} stop{'s' if stops != 1 else ''})" if stops else ""
         ref_txt = (
@@ -863,7 +1102,7 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
         )
         return (
             f"<td>{route_html}{stops_txt}<br>"
-            f"<small>{html.escape(times)}</small><br>"
+            f"<small>{times}</small><br>"
             f"<small>{', '.join(html.escape(a) for a in d.get('airlines', []))}</small>"
             f"{ref_txt}</td>"
         )
@@ -997,7 +1236,7 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
         d = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
         return d.strftime("%d %b %Y, %H:%M UTC")
 
-    def _age_hours(ts):
+    def _stats_age(ts):
         if not ts:
             return None
         dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
@@ -1025,8 +1264,8 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
     planned = len(plan_queries(cfg))
 
     kind_txt = " · ".join(f"{kinds[k]:,} {k}" for k in ("RT", "OW") if kinds.get(k))
-    newest_age = _age_hours(newest)
-    oldest_age = _age_hours(oldest)
+    newest_age = _stats_age(newest)
+    oldest_age = _stats_age(oldest)
     stat_items = [
         (f"{priced:,}", "prices tracked", kind_txt),
         (f"{priced + empty}/{planned}", "date pairs checked", f"{empty} flexible-only"),
@@ -1056,6 +1295,51 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
             f"<b>{value}</b> {html.escape(label)} {sub_html}</span>"
         )
 
+    ss_rows = conn.execute(
+        "SELECT origin, dest, d1, d2, total_results, deals_json, fetched_at"
+        " FROM skyscanner_prices ORDER BY fetched_at DESC"
+    ).fetchall()
+    ss_html = ""
+    if ss_rows:
+        cells = []
+        for origin, dest, d1, d2, total, deals_json, fetched_at in ss_rows[:8]:
+            deals = json.loads(deals_json)
+            if not deals:
+                continue
+            best = deals[0]
+            st = best.get("self_transfer") or any(d.get("self_transfer") for d in deals)
+            badge = (
+                '<span class="badge oj">self-transfer</span>'
+                if st
+                else '<span class="badge">direct tickets</span>'
+            )
+            deal = deals[0]
+            alt = ", ".join(f"{d['price_fmt']}" for d in deals[1:4])
+            cells.append(
+                f"<tr>"
+                f"<td>{origin} → {dest}</td>"
+                f"<td>{fmt_date(d1)}<br><small>{fmt_date(d2)}</small></td>"
+                f'<td class="num" data-eur="{deal["eur"]:.0f}">{deal["eur"]:.0f}</td>'
+                f"<td><small>{html.escape(deal['price_fmt'])}</small></td>"
+                f"<td><small>{html.escape(', '.join(deal['agents'][:2]) or '?')}</small></td>"
+                f"<td>{badge}</td>"
+                f'<td><a class="gf" href="{deal["link"]}" target="_blank" rel="noopener">book ↗</a></td>'
+                f"</tr>"
+            )
+        if cells:
+            ss_html = (
+                '<h3 style="margin:18px 0 8px;font-size:.95rem">Skyscanner &amp; OTA deals '
+                '<small class="muted">(separate tickets / self-transfer — book via agents,'
+                " not on Google; EUR approximated from raw currency)</small></h3>"
+                '<div class="panel table-wrap"><table><thead><tr>'
+                "<th>Route</th><th>Dates</th><th>Price</th><th>Original</th>"
+                "<th>Agent</th><th>Type</th><th>Link</th></tr></thead><tbody>"
+                + "".join(cells)
+                + "</tbody></table></div>"
+            )
+    else:
+        ss_html = ""
+
     html_doc = TEMPLATE
     html_doc = html_doc.replace("__RUN_TS__", run_ts)
     html_doc = html_doc.replace("__HUF__", str(huf))
@@ -1066,6 +1350,7 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
         + card("Cheapest open jaw", best_oj),
     )
     html_doc = html_doc.replace("__STATS__", stats_html)
+    html_doc = html_doc.replace("__SKYSCANNER__", ss_html)
     html_doc = html_doc.replace("__ROWS__", "\n".join(rows_html))
     html_doc = html_doc.replace("__ITINS__", json.dumps(shown_json, ensure_ascii=False))
     html_doc = html_doc.replace("__CHART_DATA__", json.dumps(chart_data))
@@ -1147,6 +1432,9 @@ TEMPLATE = """<!doctype html>
  .badge.oj { background: #fdf1e3; color: #a15c07; }
  .down { color: var(--good); font-weight: 600; }
  .up { color: var(--bad); font-weight: 600; }
+ .dur-ok { color: var(--good); font-weight: 600; }
+ .dur-mid { color: #b45309; font-weight: 600; }
+ .dur-bad { color: var(--bad); font-weight: 600; }
  .ind { color: var(--accent); font-size: .68rem; }
  .gf { font-size: .75rem; text-decoration: none; margin-right: 6px; white-space: nowrap; }
  .gf:hover { text-decoration: underline; }
@@ -1247,6 +1535,7 @@ __ROWS__
   <div class="chart-box"><h3>Top itineraries &mdash; total price over runs</h3><canvas id="c1"></canvas></div>
   <div class="chart-box"><h3>Cheapest overall over runs</h3><canvas id="c2"></canvas></div>
  </div>
+ __SKYSCANNER__
 </div>
 <dialog id="dlg">
  <div class="dlg-head">
@@ -1305,6 +1594,9 @@ function fdate(iso) {
   return new Date(iso + 'T12:00:00').toLocaleDateString('en-GB',
     { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
 }
+function durCls(h) {
+  return h <= 20 ? 'dur-ok' : (h <= 24 ? 'dur-mid' : 'dur-bad');
+}
 function legHtml(d, label, unavailable) {
   if (!d || (unavailable && !d.is_reference)) {
     return `<div class="dlg-leg"><h3>${label}</h3>
@@ -1317,7 +1609,8 @@ function legHtml(d, label, unavailable) {
   const route = (ref ? '≈ ' : '') + codes.map(c => `<span title="${esc(names[c] || c)}">${esc(c)}</span>`).join(' → ');
   const nameList = [...new Set(codes.map(c => names[c] || c))].join(' · ');
   const times = d.dep ? `${esc(d.dep)} → ${esc(d.arr)}` +
-    (d.plus ? ` (+${d.plus})` : '') + (d.dur_h ? ` · ${d.dur_h}h` : '') : '';
+    (d.plus ? ` (+${d.plus})` : '') +
+    (d.dur_h ? ` · <span class="${durCls(d.dur_h)}">${d.dur_h}h</span>` : '') : '';
   const stops = (d.stops ?? null) === null ? '' :
     ` · ${d.stops} stop${d.stops === 1 ? '' : 's'}`;
   const fetched = d.fetched_at ? `fetched ${esc(d.fetched_at.replace('T', ' ').replace('Z', ' UTC'))}` : '';
@@ -1422,6 +1715,10 @@ def main():
     run_ts = now_iso()
 
     progress = run_scan(cfg, conn, args, run_ts)
+    rows = load_rows(conn)
+    itins = build_itineraries(cfg, rows)
+    label_itins(itins)
+    run_skyscanner_if_due(cfg, conn, args, itins)
     rows = load_rows(conn)
     itins = build_itineraries(cfg, rows)
     label_itins(itins)

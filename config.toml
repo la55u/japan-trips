@@ -18,6 +18,16 @@ flixbus_eur = 15.0         # Budapest <-> Vienna, per direction
 
 [currency]
 huf_per_eur = 395.0
+gbp_per_eur = 1.17
+
+[skyscanner]
+enabled = true
+# spot-check cadence: min hours between Skyscanner runs
+min_age_hours = 20
+# how many top route/date combos to check per run
+combos = 6
+# deals to keep per combo
+top_deals = 10
 
 [cache]
 # Local runs write here (gitignored). CI scans use the repo-owned flights.db
