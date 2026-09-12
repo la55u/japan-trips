@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import logging
 import random
 import re
 import sqlite3
@@ -24,6 +25,17 @@ BASE = Path(__file__).resolve().parent
 SOCS_COOKIE = "SOCS=CAESHAgBEhJnd3NfMjAyMzA4MTAtMF9SQzEaAmVuIAEaBgiA_LyaBg"
 TYO, OSA = "TYO", "OSA"
 VIE = "VIE"
+
+log = logging.getLogger("flight_search")
+
+
+def setup_logging(verbose: bool):
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)-7s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S%z",
+    )
 
 
 def now_iso() -> str:
@@ -49,6 +61,7 @@ def parse_args():
         action="store_true",
         help="skip fetching, rebuild ranking + HTML from cache",
     )
+    p.add_argument("--verbose", action="store_true", help="debug logging")
     p.add_argument("--out", default=str(BASE / "results.html"))
     return p.parse_args()
 
@@ -196,7 +209,16 @@ def fetch_with_retry(q, attempts=3):
             last = "no results"
         except Exception as e:
             last = f"{type(e).__name__}: {e}"
-        time.sleep(2 + i * 3 + random.random() * 2)
+        if i < attempts - 1:
+            delay = 2 + i * 3 + random.random() * 2
+            log.warning(
+                "attempt %d/%d failed (%s), retrying in %.0fs",
+                i + 1,
+                attempts,
+                last,
+                delay,
+            )
+            time.sleep(delay)
     return None, last
 
 
@@ -245,16 +267,17 @@ def plan_queries(cfg):
     return rt + ow
 
 
-def run_scan(cfg, conn, args):
+def run_scan(cfg, conn, args, run_ts):
     scan = cfg["scan"]
     ttl = cfg["cache"]["ttl_hours"] * 3600
     workers = args.workers or scan["workers"]
     if args.step:
         cfg["search"]["step_days"] = args.step
+    s = cfg["search"]
     all_queries = plan_queries(cfg)
     todo = []
     if args.rank_only:
-        todo = []
+        log.info("--rank-only: skipping all fetching, rebuilding from cache")
     else:
         now = time.time()
         for spec in all_queries:
@@ -275,26 +298,49 @@ def run_scan(cfg, conn, args):
     if args.limit and len(todo) > args.limit:
         todo = todo[: args.limit]
 
-    print(
-        f"{len(all_queries)} total queries, {len(todo)} to fetch, cache hit {len(all_queries) - len(todo)}"
+    log.info(
+        "run %s | window %s..%s | trip %d-%dd | origins=%s destinations=%s "
+        "max_stops=%d checked_bags=%d | ttl=%dh workers=%d force=%s limit=%s",
+        run_ts,
+        s["date_start"],
+        s["date_end"],
+        s["trip_min_days"],
+        s["trip_max_days"],
+        ",".join(s["origins"]),
+        ",".join(s["destinations"]),
+        s["max_stops"],
+        s["checked_bags"],
+        cfg["cache"]["ttl_hours"],
+        workers,
+        args.force,
+        args.limit or "none",
+    )
+    log.info(
+        "%d planned queries: %d to fetch, %d served from cache",
+        len(all_queries),
+        len(todo),
+        len(all_queries) - len(todo),
     )
 
     lock = threading.Lock()
     progress = {"n": 0, "fail": 0, "cached": len(all_queries) - len(todo)}
+    scan_start = time.time()
 
     def work(item):
         spec, key = item
         kind, origin, dest, d1, d2 = spec
         q = build_query(kind, origin, dest, d1, d2, cfg)
+        t0 = time.time()
         out = fetch_with_retry(q)
-        return spec, key, q, out
+        return spec, key, q, out, time.time() - t0
 
+    consec_fail = 0
     futures = []
     with ThreadPoolExecutor(max_workers=workers) as ex:
         for item in todo:
             futures.append(ex.submit(work, item))
         for fut in as_completed(futures):
-            spec, key, q, out = fut.result()
+            spec, key, q, out, elapsed = fut.result()
             fetched = now_iso()
             price = None
             detail = None
@@ -311,7 +357,34 @@ def run_scan(cfg, conn, args):
                 n, f_, c = progress["n"], progress["fail"], progress["cached"]
                 done = n + c
             tag = f"{spec[0]} {spec[1]}->{spec[2]} {spec[3]}..{spec[4] or ''}"
-            print(f"[{done}/{len(all_queries)}] {tag}: {price if price else out[1]}")
+            if price is not None:
+                consec_fail = 0
+                log.info(
+                    "[%d/%d] %s: %.0f EUR, %d itineraries, best %s, %.1fs",
+                    done,
+                    len(all_queries),
+                    tag,
+                    price,
+                    n_results,
+                    json.loads(detail).get("route", "?"),
+                    elapsed,
+                )
+            else:
+                consec_fail += 1
+                if consec_fail >= 5:
+                    log.warning(
+                        "%d consecutive failures - possible throttling/captcha",
+                        consec_fail,
+                    )
+                log.warning(
+                    "[%d/%d] %s: FAILED after %d attempts (%s), %.1fs",
+                    done,
+                    len(all_queries),
+                    tag,
+                    3,
+                    out[1],
+                    elapsed,
+                )
             prev = conn.execute(
                 "SELECT price, fetched_at FROM price_cache WHERE key=?", (key,)
             ).fetchone()
@@ -347,6 +420,14 @@ def run_scan(cfg, conn, args):
                     (key, price, fetched),
                 )
             conn.commit()
+
+    log.info(
+        "scan finished in %.0fs: fetched=%d failed=%d cached=%d",
+        time.time() - scan_start,
+        progress["n"],
+        progress["fail"],
+        progress["cached"],
+    )
     return progress
 
 
@@ -483,12 +564,13 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
     best_rt = next((i for i in itins if i["kind"] == "RT"), None)
     best_oj = next((i for i in itins if i["kind"] == "OJ"), None)
 
-    def card(label, it):
+    def card(label, it, best=False):
+        cls = "card best" if best else "card"
         if not it:
-            return f'<div class="card"><div class="card-label">{label}</div><div class="card-value">no data yet</div></div>'
+            return f'<div class="{cls}"><div class="card-label">{label}</div><div class="card-value">no data yet</div></div>'
         return (
-            f'<div class="card"><div class="card-label">{label}</div>'
-            f'<div class="card-value" data-eur="{it["total"]:.0f}">{it["total"]:.0f} EUR</div>'
+            f'<div class="{cls}"><div class="card-label">{label}</div>'
+            f'<div class="card-value" data-eur="{it["total"]:.0f}">{it["total"]:.0f} <span class="cur">EUR</span></div>'
             f'<div class="card-sub">{html.escape(it["label"])}</div></div>'
         )
 
@@ -522,6 +604,7 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
         )
 
     rows_html = []
+    shown_json = []
     for i, it in enumerate(shown, 1):
         o, r = it["out_detail"], it["ret_detail"]
         kind_label = "Round trip" if it["kind"] == "RT" else "Open jaw"
@@ -546,21 +629,44 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
             q2 = build_query("OW", it["out_city"], it["ret_dest"], it["d2"], None, cfg)
             gf_links.append(q2.url())
         links = " ".join(
-            f'<a href="{u}" target="_blank" rel="noopener">GF{i + 1}</a>'
+            f'<a class="gf" href="{u}" target="_blank" rel="noopener">GF{i + 1} ↗</a>'
             for i, u in enumerate(gf_links)
         )
         tr_items = "; ".join(f"{n} ({v:.0f})" for n, v in it["transfer_items"])
+        idx = i - 1
+        badge_cls = "badge" if it["kind"] == "RT" else "badge oj"
         rows_html.append(
-            f'<tr data-eur-total="{it["total"]:.2f}">'
-            f"<td>{i}</td><td>{kind_label}</td><td>{route_txt}</td>"
+            f'<tr data-eur-total="{it["total"]:.2f}" data-i="{idx}" title="click for details">'
+            f'<td class="rank">{i}</td><td><span class="{badge_cls}">{kind_label}</span></td><td>{route_txt}</td>'
             f"<td>{fmt_date(it['d1'])}</td><td>{fmt_date(it['d2'])}</td>"
-            f"<td>{(date.fromisoformat(it['d2']) - date.fromisoformat(it['d1'])).days}</td>"
+            f'<td class="num">{(date.fromisoformat(it["d2"]) - date.fromisoformat(it["d1"])).days}</td>'
             f"{leg_cell(o)}"
             f"{leg_cell(r, unavailable=(it['kind'] == 'RT'))}"
-            f'<td data-eur="{it["airfare"]:.0f}">{it["airfare"]:.0f}</td>'
-            f'<td data-eur="{it["transfers"]:.0f}" title="{html.escape(tr_items)}">{it["transfers"]:.0f}</td>'
-            f'<td data-eur="{it["total"]:.0f}" class="total">{it["total"]:.0f}</td>'
-            f"<td>{delta}</td><td>{links}</td></tr>"
+            f'<td class="num" data-eur="{it["airfare"]:.0f}">{it["airfare"]:.0f}</td>'
+            f'<td class="num" data-eur="{it["transfers"]:.0f}" title="{html.escape(tr_items)}">{it["transfers"]:.0f}</td>'
+            f'<td class="num total" data-eur="{it["total"]:.0f}">{it["total"]:.0f}</td>'
+            f'<td class="num">{delta}</td><td>{links}</td></tr>'
+        )
+        prev_total = prev.get(it["key"])
+        shown_json.append(
+            {
+                "kind_label": kind_label,
+                "route_txt": route_txt,
+                "d1": it["d1"],
+                "d2": it["d2"],
+                "days": (
+                    date.fromisoformat(it["d2"]) - date.fromisoformat(it["d1"])
+                ).days,
+                "airfare": it["airfare"],
+                "transfers": it["transfers"],
+                "total": it["total"],
+                "prev_total": prev.get(it["key"]),
+                "transfer_items": it["transfer_items"],
+                "gf_links": gf_links,
+                "out": o,
+                "ret": r if it["kind"] == "OJ" else None,
+                "ret_unavailable": it["kind"] == "RT",
+            }
         )
 
     hist_top = shown[: cfg["scan"]["history_top_n"]]
@@ -620,11 +726,12 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
     html_doc = html_doc.replace("__HUF__", str(huf))
     html_doc = html_doc.replace(
         "__CARDS__",
-        card("Cheapest overall", itins[0] if itins else None)
+        card("Cheapest overall", itins[0] if itins else None, best=True)
         + card("Cheapest round trip", best_rt)
         + card("Cheapest open jaw", best_oj),
     )
     html_doc = html_doc.replace("__ROWS__", "\n".join(rows_html))
+    html_doc = html_doc.replace("__ITINS__", json.dumps(shown_json, ensure_ascii=False))
     html_doc = html_doc.replace("__CHART_DATA__", json.dumps(chart_data))
     html_doc = html_doc.replace("__BEST_CHART__", json.dumps(best_chart))
     html_doc = html_doc.replace(
@@ -640,60 +747,170 @@ TEMPLATE = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>BUD/VIE -&gt; Japan flight deals</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
 <style>
- body { font-family: system-ui, sans-serif; margin: 24px; background: #fafafa; color: #222; }
- h1 { font-size: 1.4rem; } .meta { color: #666; font-size: .85rem; }
- .cards { display: flex; gap: 16px; margin: 16px 0; flex-wrap: wrap; }
- .card { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 12px 20px; }
- .card-label { font-size: .8rem; color: #666; }
- .card-value { font-size: 1.6rem; font-weight: 600; }
- .card-sub { font-size: .8rem; color: #444; max-width: 260px; }
- table { border-collapse: collapse; background: #fff; font-size: .85rem; width: 100%; }
- th, td { border: 1px solid #e0e0e0; padding: 6px 8px; text-align: left; vertical-align: top; }
- th { cursor: pointer; background: #f0f0f0; user-select: none; white-space: nowrap; }
- td.total { font-weight: 700; }
- .down { color: #1a7f37; font-weight: 600; } .up { color: #c62828; font-weight: 600; }
- .ind { color: #1a56db; font-size: .7rem; }
- .toggle button { margin-right: 6px; padding: 4px 14px; cursor: pointer; }
- .toggle button.active { background: #222; color: #fff; border-color: #222; }
- .charts { display: flex; gap: 24px; flex-wrap: wrap; margin-top: 24px; }
- .chart-box { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 12px; width: 560px; max-width: 100%; }
- small { color: #666; }
- a { color: #1a56db; }
+ :root {
+   --bg: #f5f6f8; --card: #ffffff; --line: #e6e8ec; --line-soft: #eef0f3;
+   --text: #191d24; --muted: #69707a; --accent: #2456c8; --accent-soft: #eef3fd;
+   --good: #17803d; --good-soft: #e8f5ec; --bad: #b42318; --bad-soft: #fdeceb;
+ }
+ * { box-sizing: border-box; }
+ body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; margin: 0;
+        background: var(--bg); color: var(--text); line-height: 1.45; }
+ .wrap { max-width: 1280px; margin: 0 auto; padding: 22px 18px 44px; }
+ .top { padding: 2px 0 4px; }
+ h1 { font-size: 1.3rem; margin: 0 0 2px; letter-spacing: -0.01em; }
+ .meta { color: var(--muted); font-size: .82rem; }
+ .toolbar { display: flex; align-items: center; justify-content: space-between;
+            flex-wrap: wrap; gap: 10px; margin: 16px 0 12px; }
+ .seg { display: inline-flex; background: var(--card); border: 1px solid var(--line);
+        border-radius: 999px; padding: 3px; }
+ .seg button { border: none; background: transparent; padding: 5px 16px;
+               border-radius: 999px; cursor: pointer; font-size: .85rem; color: var(--muted); }
+ .seg button.active { background: var(--text); color: #fff; }
+ .hint { color: var(--muted); font-size: .8rem; }
+ .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+          gap: 12px; margin-bottom: 14px; }
+ .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+         padding: 13px 18px; }
+ .card.best { border-color: var(--accent); background: linear-gradient(0deg, var(--accent-soft), var(--card) 70%); }
+ .card-label { font-size: .7rem; letter-spacing: .07em; text-transform: uppercase;
+               color: var(--muted); font-weight: 600; }
+ .card-value { font-size: 1.65rem; font-weight: 700; margin: 2px 0;
+               font-variant-numeric: tabular-nums; }
+ .card-value .cur { font-size: 1rem; font-weight: 600; color: var(--muted); }
+ .card-sub { font-size: .8rem; color: var(--muted); }
+ .panel { background: var(--card); border: 1px solid var(--line); border-radius: 14px; }
+ .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; border-radius: 14px; }
+ table { border-collapse: collapse; font-size: .85rem; width: 100%; }
+ thead th { position: sticky; top: 0; z-index: 2; background: var(--card);
+            border-bottom: 2px solid var(--line); padding: 10px;
+            font-size: .68rem; letter-spacing: .05em; text-transform: uppercase;
+            color: var(--muted); text-align: left; cursor: pointer; user-select: none;
+            white-space: nowrap; }
+ tbody td { padding: 9px 10px; border-bottom: 1px solid var(--line-soft);
+            vertical-align: top; }
+ tbody tr:last-child td { border-bottom: none; }
+ tbody tr { cursor: pointer; }
+ tbody tr:hover { background: var(--accent-soft); }
+ .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+ td.total { font-weight: 700; color: var(--accent); font-size: .95rem; }
+ .rank { color: var(--muted); }
+ td small, .dlg small { color: var(--muted); }
+ .badge { display: inline-block; font-size: .68rem; font-weight: 600; padding: 2px 9px;
+          border-radius: 999px; white-space: nowrap; background: var(--accent-soft);
+          color: var(--accent); }
+ .badge.oj { background: #fdf1e3; color: #a15c07; }
+ .down { color: var(--good); font-weight: 600; }
+ .up { color: var(--bad); font-weight: 600; }
+ .ind { color: var(--accent); font-size: .68rem; }
+ .gf { font-size: .75rem; text-decoration: none; margin-right: 6px; white-space: nowrap; }
+ .gf:hover { text-decoration: underline; }
+ .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+           gap: 12px; margin-top: 14px; }
+ .chart-box { background: var(--card); border: 1px solid var(--line);
+              border-radius: 14px; padding: 14px; }
+ .chart-box h3 { margin: 0 0 10px; font-size: .88rem; font-weight: 600; }
+ .foot { color: var(--muted); font-size: .78rem; margin-top: 16px; max-width: 920px; }
+ dialog { border: none; border-radius: 16px; padding: 0; width: min(560px, 94vw);
+          max-height: 86vh; box-shadow: 0 24px 60px rgba(10, 15, 30, .35); }
+ dialog::backdrop { background: rgba(15, 20, 30, .5); backdrop-filter: blur(2px); }
+ .dlg-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+             background: var(--text); color: #fff; padding: 14px 18px;
+             border-radius: 16px 16px 0 0; }
+ .dlg-head h2 { margin: 0; font-size: 1rem; font-weight: 650; line-height: 1.3; }
+ .dlg-close { background: none; border: none; color: #fff; font-size: 1.3rem; line-height: 1;
+              cursor: pointer; padding: 3px 8px; border-radius: 8px; flex-shrink: 0; }
+ .dlg-close:hover { background: rgba(255,255,255,.15); }
+ .dlg-body { padding: 16px 18px 18px; overflow-y: auto; font-size: .9rem; }
+ .dlg-dates { color: var(--muted); margin-bottom: 12px; font-size: .85rem; }
+ .dlg-leg { background: #f8f9fb; border: 1px solid var(--line-soft); border-radius: 10px;
+            padding: 11px 13px; margin-bottom: 10px; }
+ .dlg-leg h3 { margin: 0 0 5px; font-size: .72rem; letter-spacing: .06em;
+               text-transform: uppercase; color: var(--accent); }
+ .dlg-leg .route { font-size: 1.02rem; font-weight: 650; }
+ .dlg-leg .airports { color: var(--muted); font-size: .78rem; margin: 3px 0 5px; }
+ .dlg-leg .fetched { color: var(--muted); font-size: .74rem; margin-top: 5px; }
+ .dlg-costs { width: 100%; border-collapse: collapse; margin: 6px 0 2px; }
+ .dlg-costs td { border: none; border-top: 1px solid var(--line-soft); padding: 6px 4px; }
+ .dlg-costs td:last-child { text-align: right; white-space: nowrap;
+                            font-variant-numeric: tabular-nums; }
+ .dlg-costs .grand { font-weight: 700; font-size: 1.08rem; color: var(--accent); }
+ .dlg-links { margin-top: 12px; }
+ .dlg-links a { display: inline-block; margin: 0 8px 6px 0; padding: 6px 14px;
+                border: 1px solid var(--accent); border-radius: 8px;
+                text-decoration: none; font-size: .83rem; color: var(--accent); }
+ .dlg-links a:hover { background: var(--accent); color: #fff; }
+ .delta-chip { display: inline-block; padding: 2px 9px; border-radius: 999px;
+               font-size: .78rem; font-weight: 600; }
+ .delta-chip.down { background: var(--good-soft); color: var(--good); }
+ .delta-chip.up { background: var(--bad-soft); color: var(--bad); }
+ .muted { color: var(--muted); }
+ @media (max-width: 720px) {
+   .wrap { padding: 14px 10px 32px; }
+   h1 { font-size: 1.05rem; }
+   .meta { font-size: .75rem; }
+   .cards { grid-template-columns: 1fr; gap: 8px; }
+   .card { padding: 10px 14px; }
+   .card-value { font-size: 1.3rem; }
+   table { font-size: .72rem; }
+   thead th { padding: 8px 6px; }
+   tbody td { padding: 7px 6px; }
+   .chart-box { padding: 10px; }
+   .dlg-body { padding: 12px 14px 14px; }
+   .hint { display: none; }
+ }
 </style>
 </head>
 <body>
-<h1>BUD/VIE &harr; Tokyo/Osaka deals &mdash; 12&ndash;16 days, 2027-03-25 &rarr; 2027-05-31</h1>
-<div class="meta">__META__</div>
-<div class="toggle" style="margin:12px 0">
- <button id="btn-eur" class="active" onclick="setCur('EUR')">EUR</button>
- <button id="btn-huf" onclick="setCur('HUF')">HUF</button>
-</div>
-<div class="cards">__CARDS__</div>
-<table id="tbl">
-<thead><tr>
- <th data-k="0">#</th><th data-k="1">Type</th><th data-k="2">Route</th>
- <th data-k="3">Outbound</th><th data-k="4">Return</th><th data-k="5">Days</th>
- <th data-k="6">Outbound leg</th><th data-k="7">Return leg</th>
- <th data-k="8">Airfare</th><th data-k="9">Transfers</th><th data-k="10">Total</th>
- <th data-k="11">&Delta;</th><th>Links</th>
-</tr></thead>
-<tbody>
+<div class="wrap">
+ <div class="top">
+  <h1>BUD/VIE &harr; Tokyo/Osaka deals &mdash; 12&ndash;16 days, 2027-03-25 &rarr; 2027-05-31</h1>
+  <div class="meta">__META__</div>
+ </div>
+ <div class="toolbar">
+  <div class="seg">
+   <button id="btn-eur" class="active" onclick="setCur('EUR')">EUR</button>
+   <button id="btn-huf" onclick="setCur('HUF')">HUF</button>
+  </div>
+  <div class="hint">click a row for full details &middot; click a column header to sort</div>
+ </div>
+ <div class="cards">__CARDS__</div>
+ <div class="panel table-wrap">
+ <table id="tbl">
+ <thead><tr>
+  <th data-k="0">#</th><th data-k="1">Type</th><th data-k="2">Route</th>
+  <th data-k="3">Outbound</th><th data-k="4">Return</th><th data-k="5" class="num">Days</th>
+  <th data-k="6">Outbound leg</th><th data-k="7">Return leg</th>
+  <th data-k="8" class="num">Airfare</th><th data-k="9" class="num">Transfers</th><th data-k="10" class="num">Total</th>
+  <th data-k="11" class="num">&Delta;</th><th>Links</th>
+ </tr></thead>
+ <tbody>
 __ROWS__
 </tbody>
-</table>
-<p><small>Prices per person in EUR, 1 adult query, checked bag included, max 2 stops.
-Open jaw = sum of two one-ways (verify multi-city on Google Flights via links).
-Times are local; (+n) = arrival n days after departure; duration includes layovers.
-For round trips the API only exposes outbound leg details (times/duration), not the return leg.
-Transfers are config estimates: open jaw = shinkansen; round trip = shinkansen + domestic flight;
-FlixBus added per Vienna leg. &Delta; vs previous run. Hover airport codes for full names.</small></p>
-<div class="charts">
- <div class="chart-box"><h3>Top itineraries &mdash; total price over runs</h3><canvas id="c1"></canvas></div>
- <div class="chart-box"><h3>Cheapest overall over runs</h3><canvas id="c2"></canvas></div>
+ </table>
+ </div>
+ <p class="foot">Prices per person, 1-adult query, checked bag included, max 2 stops.
+ Open jaw = sum of two one-ways (verify the true multi-city price via the GF links).
+ Times are local; (+n) = arrival n days after departure; duration includes layovers.
+ For round trips the API only exposes outbound leg details, not the return leg.
+ Transfers are config estimates: open jaw = shinkansen; round trip = shinkansen + domestic
+ flight; FlixBus per Vienna leg. &Delta; vs previous run. Airport codes carry full names
+ on hover &mdash; or click any row for a detail card.</p>
+ <div class="charts">
+  <div class="chart-box"><h3>Top itineraries &mdash; total price over runs</h3><canvas id="c1"></canvas></div>
+  <div class="chart-box"><h3>Cheapest overall over runs</h3><canvas id="c2"></canvas></div>
+ </div>
 </div>
+<dialog id="dlg">
+ <div class="dlg-head">
+  <h2 id="dlg-title"></h2>
+  <button class="dlg-close" aria-label="Close" onclick="document.getElementById('dlg').close()">&#10005;</button>
+ </div>
+ <div class="dlg-body" id="dlg-body"></div>
+</dialog>
 <script>
 const HUF = __HUF__;
 let cur = 'EUR';
@@ -701,9 +918,11 @@ function fmt(v) {
   return cur === 'EUR' ? Math.round(v).toLocaleString('en') + ' €'
     : Math.round(v * HUF).toLocaleString('hu') + ' Ft';
 }
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
 function apply() {
   document.querySelectorAll('[data-eur]').forEach(el => { el.textContent = fmt(parseFloat(el.dataset.eur)); });
-  document.querySelectorAll('[data-eur-total]').forEach(el => { el.dataset.v = el.dataset.eurTotal; });
   document.getElementById('btn-eur').classList.toggle('active', cur === 'EUR');
   document.getElementById('btn-huf').classList.toggle('active', cur === 'HUF');
   redrawSort();
@@ -737,6 +956,72 @@ function sortBy(th) {
   redrawSort();
 }
 function setCur(c) { cur = c; apply(); }
+const ITINS = __ITINS__;
+function fdate(iso) {
+  return new Date(iso + 'T12:00:00').toLocaleDateString('en-GB',
+    { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
+}
+function legHtml(d, label, unavailable) {
+  if (!d || unavailable) {
+    return `<div class="dlg-leg"><h3>${label}</h3>
+      <div class="muted">Leg details are not exposed by the API for round-trip queries &mdash;
+      use the Google Flights link below to verify.</div></div>`;
+  }
+  const names = d.airports || {};
+  const codes = (d.route || '').split(' -> ');
+  const route = codes.map(c => `<span title="${esc(names[c] || c)}">${esc(c)}</span>`).join(' → ');
+  const nameList = [...new Set(codes.map(c => names[c] || c))].join(' · ');
+  const times = d.dep ? `${esc(d.dep)} → ${esc(d.arr)}` +
+    (d.plus ? ` (+${d.plus})` : '') + (d.dur_h ? ` · ${d.dur_h}h` : '') : '';
+  const stops = (d.stops ?? null) === null ? '' :
+    ` · ${d.stops} stop${d.stops === 1 ? '' : 's'}`;
+  const fetched = d.fetched_at ? `fetched ${esc(d.fetched_at.replace('T', ' ').replace('Z', ' UTC'))}` : '';
+  return `<div class="dlg-leg"><h3>${label}</h3>
+    <div class="route">${route}</div>
+    <div class="airports">${esc(nameList)}</div>
+    <div>${times}${stops}</div>
+    <div><small>${esc((d.airlines || []).join(', '))}</small></div>
+    <div class="fetched">${fetched}</div></div>`;
+}
+function showDetails(it) {
+  document.getElementById('dlg-title').textContent =
+    `${it.kind_label} — ${it.route_txt}`;
+  let delta = '';
+  if (it.prev_total != null && it.prev_total !== it.total) {
+    const diff = it.total - it.prev_total;
+    delta = diff < 0
+      ? `<span class="delta-chip down">▼ ${fmt(Math.abs(diff)).trim()} cheaper</span>`
+      : `<span class="delta-chip up">▲ ${fmt(diff).trim()} more</span>`;
+  }
+  const rows = [
+    ['Airfare', fmt(it.airfare)],
+    ...it.transfer_items.map(([n, v]) => [esc(n), fmt(v)]),
+  ];
+  const costs = rows.map(([n, v]) =>
+    `<tr><td>${n}</td><td>${v}</td></tr>`).join('');
+  const links = it.gf_links.map((u, i) =>
+    `<a href="${u}" target="_blank" rel="noopener">Google Flights ${it.gf_links.length > 1 ? i + 1 : ''}</a>`).join('');
+  document.getElementById('dlg-body').innerHTML = `
+    <div class="dlg-dates">${fdate(it.d1)} → ${fdate(it.d2)} · ${it.days} days · price per person</div>
+    ${legHtml(it.out, 'Outbound')}
+    ${legHtml(it.ret, 'Return', it.ret_unavailable)}
+    <table class="dlg-costs">
+      ${rows}
+      <tr class="grand"><td>Total per person</td><td class="grand">${fmt(it.total)}</td></tr>
+    </table>
+    <div>${delta}</div>
+    <div class="dlg-links">${links}</div>`;
+  document.getElementById('dlg').showModal();
+}
+const dlg = document.getElementById('dlg');
+document.querySelectorAll('#tbl tbody tr').forEach(tr => {
+  tr.addEventListener('click', e => {
+    if (e.target.closest('a')) return;
+    const it = ITINS[parseInt(tr.dataset.i)];
+    if (it) showDetails(it);
+  });
+});
+dlg.addEventListener('click', e => { if (e.target === dlg) dlg.close(); });
 const chartData = __CHART_DATA__;
 const bestChart = __BEST_CHART__;
 new Chart(document.getElementById('c1'), {
@@ -755,27 +1040,44 @@ apply();
 """
 
 
-def main():
-    args = parse_args()
-    cfg = load_config(args.config)
-    conn = init_db(cfg["cache"]["db"])
-    run_ts = now_iso()
-
-    progress = run_scan(cfg, conn, args)
-    rows = load_rows(conn)
-    itins = build_itineraries(cfg, rows)
-    prev, prev_ts = prev_totals(conn)
-
-    labels = {
-        "RT": "Round trip",
-        "OJ": "Open jaw",
-    }
+def label_itins(itins):
+    labels = {"RT": "Round trip", "OJ": "Open jaw"}
     for it in itins:
         direction = f"{it['in_city']}/{it['out_city']}"
         it["label"] = (
             f"{labels[it['kind']]} {it['out_origin']}→{it['ret_dest']} "
             f"(via {direction}) {it['d1']} → {it['d2']}"
         )
+
+
+def refresh_html(cfg, conn, args, run_ts, progress):
+    rows = load_rows(conn)
+    itins = build_itineraries(cfg, rows)
+    label_itins(itins)
+    prev, prev_ts = prev_totals(conn)
+    html_doc = render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress)
+    Path(args.out).write_text(html_doc, encoding="utf-8")
+    return itins, prev, prev_ts
+
+
+def main():
+    args = parse_args()
+    setup_logging(args.verbose)
+    started = time.time()
+    cfg = load_config(args.config)
+    conn = init_db(cfg["cache"]["db"])
+    run_ts = now_iso()
+
+    progress = run_scan(cfg, conn, args, run_ts)
+    rows = load_rows(conn)
+    itins = build_itineraries(cfg, rows)
+    label_itins(itins)
+    prev, prev_ts = prev_totals(conn)
+    log.info(
+        "ranked %d itineraries (prev run for deltas: %s)",
+        len(itins),
+        prev_ts or "none",
+    )
 
     for it in itins[: cfg["scan"]["top_n"]]:
         conn.execute(
@@ -796,16 +1098,25 @@ def main():
         (run_ts, progress["n"], progress["cached"], progress["fail"], ""),
     )
     conn.commit()
+    log.info(
+        "recorded %d itinerary snapshots + run stats",
+        min(len(itins), cfg["scan"]["top_n"]),
+    )
 
     html_doc = render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress)
     Path(args.out).write_text(html_doc, encoding="utf-8")
 
-    print(f"\n{len(itins)} itineraries ranked. Top 10 (per person):")
+    log.info("%d itineraries ranked. Top 10 (per person):", len(itins))
     for it in itins[:10]:
-        print(f"  {it['total']:7.0f} EUR  {it['label']}")
-    print(f"\nHTML written to {args.out}")
-    print(
-        f"fetched={progress['n']} cached={progress['cached']} failed={progress['fail']}"
+        log.info("  %7.0f EUR  %s", it["total"], it["label"])
+    log.info(
+        "done in %.0fs | HTML written to %s (%.0f KB) | fetched=%d cached=%d failed=%d",
+        time.time() - started,
+        args.out,
+        len(html_doc) / 1024,
+        progress["n"],
+        progress["cached"],
+        progress["fail"],
     )
 
 

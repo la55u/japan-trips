@@ -58,6 +58,8 @@ losing progress — the next run only fetches what's still missing or stale.
   `(+n)` = arrival n days after departure, total duration in hours incl. layovers, stops,
   airlines, and Google Flights links to verify/book.
 - Δ column shows price movement vs the previous run.
+- Click/tap any row for a detail card (native HTML dialog): full airport names, times,
+  durations, itemized cost breakdown, and Google Flights links.
 - Two Chart.js charts: per-itinerary price history and cheapest-overall-per-run trend.
 
 ## Caching & history (`flights.db`, SQLite)
