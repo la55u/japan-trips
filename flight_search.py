@@ -654,7 +654,7 @@ def parse_payload(html_text):
     js = m.group(1)
     data = js.split("data:", 1)[1].rsplit(",", 1)[0]
     if data.endswith("errorHasStatus: true"):
-        raise RuntimeError("google returned an error status")
+        log.debug("google error-status page (treated as no-exact-results)")
     payload = json.loads(data)
     suggestions = _suggestions(payload)
     if payload[3] is None or payload[3][0] is None:
