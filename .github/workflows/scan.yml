@@ -2,7 +2,7 @@ name: scan
 
 on:
   schedule:
-    - cron: "0 * * * *" # hourly (Budapest time = UTC+1/+2)
+    - cron: "23 * * * *" # hourly at :23 (off-peak minute; top-of-hour crons get delayed/skipped)
   workflow_dispatch:
 
 permissions:
