@@ -801,6 +801,18 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(itins, [])
         self.assertFalse(recognized)
 
+    def test_ds1_payload_with_trailing_metadata_parses(self):
+        html = (
+            '<html><script id="ds:1" nonce="abc">'
+            "AF_initDataCallback({key: 'ds:1', data:[null,null,[],null], "
+            "sideFreebird:true, errorHasStatus: true});</script></html>"
+        )
+        # the old split/rsplit extraction turned the trailing metadata into
+        # "Extra data" JSONDecodeErrors on ~11/450 real pages
+        itins, suggestions = fs.parse_payload(html)
+        self.assertEqual(itins, [])
+        self.assertEqual(suggestions, [])
+
 
 class RenderTests(unittest.TestCase):
     def test_table_filters_and_per_bucket_candidates_are_rendered(self):

@@ -55,7 +55,11 @@ NOT used; it crashes on fare-less itineraries). All HTTP via `primp` Client
 Fetch flow per query (`fetch_with_retry`), with 30-second HTTP timeouts and a shared
 2-request/second gate covering page and RPC requests:
 1. GET `https://www.google.com/travel/flights` with the tfs params → page HTML.
-2. `parse_payload`: extract the `ds:1` script, split `data:` JSON.
+2. `parse_payload`: extract the `ds:1` script and parse the JSON after `data:` with
+   `json.JSONDecoder().raw_decode` — some page variants append metadata
+   (sideFreebird/errorHasStatus) after the payload, which made plain
+   `json.loads` fail with "Extra data" (~11/450 pages in one run, all recovered
+   by retry; raw_decode ends the failure class).
    - Normal variant: `payload[3][0]` = itineraries; each entry parsed by
      `_itinerary_from_entry(k)` where `k[0]` = [type, airlines, segments] and
      `k[1][0]` = [None, price]; blob at `k[1][1]` (used for the Select-flight RPC).

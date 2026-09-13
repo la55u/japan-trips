@@ -1283,10 +1283,16 @@ def parse_payload(html_text):
     if not m:
         raise RuntimeError("no data script found in page")
     js = m.group(1)
-    data = js.split("data:", 1)[1].rsplit(",", 1)[0]
-    if data.endswith("errorHasStatus: true"):
+    try:
+        start = js.index("data:") + len("data:")
+    except ValueError:
+        raise RuntimeError("no data payload in ds:1 script") from None
+    # raw_decode stops at the end of the first JSON value; some page variants
+    # append metadata (sideFreebird, errorHasStatus, ...) after it, which
+    # breaks a plain json.loads with "Extra data".
+    payload, end = json.JSONDecoder().raw_decode(js, start)
+    if "errorHasStatus" in js[end:]:
         log.debug("google error-status page (treated as no-exact-results)")
-    payload = json.loads(data)
     suggestions = _suggestions(payload)
     if payload[3] is None or payload[3][0] is None:
         return [], suggestions
