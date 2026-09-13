@@ -23,9 +23,9 @@ gbp_per_eur = 1.17
 [skyscanner]
 enabled = true
 # spot-check cadence: min hours between Skyscanner runs
-min_age_hours = 20
-# how many top route/date combos to check per run
-combos = 6
+min_age_hours = 12
+# how many top route/date combos to check per run (3 google-top + rest gap-discovery)
+combos = 10
 # deals to keep per combo
 top_deals = 10
 
