@@ -36,7 +36,7 @@ def config():
             "top_n": 40,
             "history_top_n": 6,
         },
-        "ranking": {"max_leg_hours": 30},
+        "ranking": {"max_leg_hours": 30, "max_leg_hours_display": 48},
         "skyscanner": {
             "enabled": False,
             "max_age_hours": 36,
@@ -535,6 +535,54 @@ class SkyscannerTests(unittest.TestCase):
 
         self.assertEqual(len(result), 1)
 
+    @staticmethod
+    def _long_leg_row(dur_min_out, dur_min_ret):
+        deal = {
+            "eur": 300,
+            "agents": ["Agent"],
+            "legs": [
+                {
+                    "from": "BUD",
+                    "to": "HND",
+                    "stops": 1,
+                    "dep": "2027-03-22T10:00",
+                    "dur_min": dur_min_out,
+                },
+                {
+                    "from": "HND",
+                    "to": "BUD",
+                    "stops": 1,
+                    "dep": "2027-04-03T10:00",
+                    "dur_min": dur_min_ret,
+                },
+            ],
+        }
+        return (
+            "BUD",
+            "TYO",
+            "2027-03-22",
+            "2027-04-03",
+            1,
+            json.dumps([deal]),
+            datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            2,
+            "HUF",
+        )
+
+    def test_ota_deals_over_google_leg_cap_kept_up_to_display_cap(self):
+        cfg = config()
+        # 31h + 38h legs: over max_leg_hours (30) but under display cap (48)
+        kept = fs._ss_itineraries(cfg, [self._long_leg_row(1860, 2290)])
+        self.assertEqual(len(kept), 1)
+
+        # over the display cap: excluded
+        cfg["ranking"]["max_leg_hours_display"] = 48
+        self.assertEqual(fs._ss_itineraries(cfg, [self._long_leg_row(1860, 3200)]), [])
+
+        # display cap disabled -> falls back to max_leg_hours
+        cfg["ranking"]["max_leg_hours_display"] = 0
+        self.assertEqual(fs._ss_itineraries(cfg, [self._long_leg_row(1860, 2290)]), [])
+
     def test_universe_matches_rt_plan(self):
         cfg = config()
         universe = set(fs._ss_universe(cfg))
@@ -846,6 +894,14 @@ class RenderTests(unittest.TestCase):
         self.assertIn('data-origin="BUD" data-days="12"', rendered)
         self.assertIn('data-origin="VIE" data-days="12"', rendered)
         self.assertIn("const TABLE_LIMIT = 1;", rendered)
+        # layout: filters directly above the table, cards/stats below it
+        order = [
+            rendered.index('class="toolbar"'),
+            rendered.index('class="panel table-wrap"'),
+            rendered.index('class="cards"'),
+            rendered.index('class="stats"'),
+        ]
+        self.assertEqual(order, sorted(order))
 
     def test_ss_rows_render_source_kind_indicative_and_fare_breakdown(self):
         cfg = config()
@@ -907,7 +963,10 @@ class RenderTests(unittest.TestCase):
         self.assertRegex(rendered, r"indicative</b>, checked \d+h ago")
         self.assertIn('value="ota">OTA (Skyscanner)', rendered)
         self.assertIn("Cheapest OTA (Skyscanner)", rendered)
-        # airfare cell keeps the bag-normalized total plus the raw breakdown
+        self.assertIn('id="filter-leg-max"', rendered)
+        self.assertIn('value="24"', rendered)
+        self.assertRegex(rendered, r'data-out-dur="20\.0"')
+        self.assertRegex(rendered, r'data-ret-dur="20\.0"')
         self.assertIn(
             '<span data-eur="300">300</span> fare + <span data-eur="30">30</span> bags',
             rendered,

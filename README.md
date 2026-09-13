@@ -80,11 +80,13 @@ push promptly (the DB is a binary file and cannot merge).
 
 ## Output (`results.html`)
 
-- Summary cards: cheapest overall / round trip / open jaw / OTA (Skyscanner).
-- Top-40 table, sortable by any column (▲/▼ indicator), EUR/HUF toggle, departure-city
-  selector, source filter (Google / OTA), and minimum/maximum trip-day filters. The
-  report retains enough candidates to show the best 40 for every configured city/day
-  combination.
+- Summary cards (below the table): cheapest overall / round trip / open jaw / OTA
+  (Skyscanner).
+- Filters sit directly above the table: EUR/HUF toggle, departure-city selector, source
+  filter (Google / OTA), max single-leg duration (default 24 h — raise it to surface
+  cheap-but-slow OTA itineraries), and minimum/maximum trip-day range. Top-40 rows,
+  sortable by any column (▲/▼ indicator); the report retains enough candidates to show
+  the best 40 for every configured city/day combination.
 - Legs show route (hover airport codes for full names), local departure/arrival times,
   `(+n)` = arrival n days after departure, total duration in hours incl. layovers, stops,
   airlines, and Google Flights links to verify/book.

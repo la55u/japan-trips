@@ -80,3 +80,9 @@ history_top_n = 6
 [ranking]
 # Exclude itineraries with any known leg longer than this. Set to 0 to disable.
 max_leg_hours = 30
+# OTA deals with legs longer than max_leg_hours are still stored and rendered
+# (durations show red) so they can be found by loosening the browser's
+# max-leg filter; Google rows stay capped at max_leg_hours.
+max_leg_hours_display = 48
+# Default value of the browser-side "Max leg h" filter.
+max_leg_filter_hours = 24

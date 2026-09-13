@@ -1835,6 +1835,11 @@ def _ss_itineraries(cfg, ss_rows):
     s = cfg["search"]
     sk_cfg = cfg.get("skyscanner", {})
     max_hours = cfg.get("ranking", {}).get("max_leg_hours", 0)
+    # OTA deals with longer legs than the Google cap are still stored and
+    # shown (their durations render red); the browser's max-leg filter
+    # (default 24h) hides them so they can be found manually.
+    display_hours = cfg.get("ranking", {}).get("max_leg_hours_display", 0)
+    leg_cap = max(filter(None, (max_hours, display_hours)), default=0)
     max_age = sk_cfg.get("max_age_hours", 168)
     indicative_after = sk_cfg.get("indicative_after_hours", 24)
     eligible_per_pair = sk_cfg.get("eligible_deals", 5)
@@ -1885,7 +1890,7 @@ def _ss_itineraries(cfg, ss_rows):
                 or (legs[1].get("dep") or "")[:10] != d2
                 or any((leg.get("stops") or 0) > s["max_stops"] for leg in legs)
                 or any(
-                    max_hours and leg.get("dur_min") and leg["dur_min"] / 60 > max_hours
+                    leg_cap and leg.get("dur_min") and leg["dur_min"] / 60 > leg_cap
                     for leg in legs
                 )
             ):
@@ -2264,7 +2269,9 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
             airfare_cell = f'<td class="num" data-eur="{it["airfare"]:.0f}" data-sort-number="{it["airfare"]:.2f}">{it["airfare"]:.0f}</td>'
         rows_html.append(
             f'<tr data-eur-total="{it["total"]:.2f}" data-origin="{html.escape(it["out_origin"])}" '
-            f'data-days="{trip_days}" data-kind="{it["kind"]}" data-i="{idx}" title="click for details">'
+            f'data-days="{trip_days}" data-kind="{it["kind"]}" data-i="{idx}" title="click for details"'
+            f' data-out-dur="{o.get("dur_h", "") if isinstance(o, dict) else ""}"'
+            f' data-ret-dur="{r.get("dur_h", "") if isinstance(r, dict) else ""}">'
             f'<td class="rank">{i}</td><td><span class="{badge_cls}">{kind_label}</span>{agent_html}</td><td>{route_txt}</td>'
             f'<td data-sort="{it["d1"]}">{fmt_date(it["d1"])}</td>'
             f'<td data-sort="{it["d2"]}">{fmt_date(it["d2"])}</td>'
@@ -2486,6 +2493,10 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
     html_doc = html_doc.replace("__TABLE_LIMIT__", str(top_n))
     html_doc = html_doc.replace("__MIN_DAYS__", str(cfg["search"]["trip_min_days"]))
     html_doc = html_doc.replace("__MAX_DAYS__", str(cfg["search"]["trip_max_days"]))
+    html_doc = html_doc.replace(
+        "__MAX_LEG_FILTER__",
+        str(cfg.get("ranking", {}).get("max_leg_filter_hours", 24)),
+    )
     city_names = {"BUD": "Budapest", "VIE": "Vienna"}
     origin_options = '<option value="">All departure cities</option>' + "".join(
         f'<option value="{html.escape(origin)}">'
@@ -2684,7 +2695,10 @@ TEMPLATE = """<!doctype html>
       <option value="ota">OTA (Skyscanner)</option>
      </select>
     </label>
-   <label class="filter">Trip days
+    <label class="filter">Max leg h
+     <input id="filter-leg-max" type="number" min="1" step="1" value="__MAX_LEG_FILTER__" aria-label="Maximum single-leg duration in hours">
+    </label>
+    <label class="filter">Trip days
     <span class="day-range">
      <input id="filter-days-min" type="number" min="__MIN_DAYS__" max="__MAX_DAYS__" value="__MIN_DAYS__" aria-label="Minimum trip days">
      <span>to</span>
@@ -2694,27 +2708,29 @@ TEMPLATE = """<!doctype html>
    <span class="match-count" id="match-count" aria-live="polite"></span>
   </div>
  </div>
- <div class="stats">__STATS__</div>
- <div class="cards">__CARDS__</div>
- <div class="panel table-wrap">
- <table id="tbl">
- <thead><tr>
-  <th data-k="0">#</th><th data-k="1">Type</th><th data-k="2">Route</th>
-  <th data-k="3">Outbound</th><th data-k="4">Return</th><th data-k="5" class="num">Days</th>
-  <th data-k="6">Outbound leg</th><th data-k="7">Return leg</th>
-  <th data-k="8" class="num">Airfare</th><th data-k="9" class="num">Transfers</th><th data-k="10" class="num">Total</th>
-  <th data-k="11" class="num">&Delta;</th><th>Links</th>
- </tr></thead>
- <tbody>
+  <div class="panel table-wrap">
+  <table id="tbl">
+  <thead><tr>
+   <th data-k="0">#</th><th data-k="1">Type</th><th data-k="2">Route</th>
+   <th data-k="3">Outbound</th><th data-k="4">Return</th><th data-k="5" class="num">Days</th>
+   <th data-k="6">Outbound leg</th><th data-k="7">Return leg</th>
+   <th data-k="8" class="num">Airfare</th><th data-k="9" class="num">Transfers</th><th data-k="10" class="num">Total</th>
+   <th data-k="11" class="num">&Delta;</th><th>Links</th>
+  </tr></thead>
+  <tbody>
 __ROWS__
 </tbody>
- </table>
- </div>
+  </table>
+  </div>
+  <div class="cards">__CARDS__</div>
+  <div class="stats">__STATS__</div>
 <p class="foot">Prices per person from __ADULTS__-adult queries, max __MAX_STOPS__ stops.
   Google fares request one checked bag. Skyscanner/OTA fares are ranked independently of
   Google: the airfare column shows the raw OTA fare plus a conservative configured
   checked-bag estimate (hover for the breakdown). Rows marked <i>indicative</i> were
   last checked more than a day ago — re-verify via the Skyscanner link before booking.
+  The <i>Max leg h</i> filter (default 24) hides rows where any single leg is longer —
+  raise it to uncover cheaper but slower OTA itineraries (durations turn red above 24h).
  Open jaw = sum of two one-ways (verify the true multi-city price via the GF links).
  Times are local; (+n) = arrival n days after departure; duration includes layovers.
  For round trips the return leg is the actual flight paired with the shown outbound when
@@ -2764,6 +2780,7 @@ function applyFilters() {
   const rawMin = Number(document.getElementById('filter-days-min').value);
   const rawMax = Number(document.getElementById('filter-days-max').value);
   const minDays = Math.min(rawMin, rawMax), maxDays = Math.max(rawMin, rawMax);
+  const maxLeg = Number(document.getElementById('filter-leg-max').value);
   const rows = [...document.querySelectorAll('#tbl tbody tr')];
   let matching = 0, visible = 0;
   rows.forEach(row => {
@@ -2771,7 +2788,10 @@ function applyFilters() {
     const sourceMatch = !source ||
       (source === 'ota' && kind === 'SS') ||
       (source === 'google' && (kind === 'RT' || kind === 'OJ'));
-    const match = sourceMatch &&
+    const outH = parseFloat(row.dataset.outDur), retH = parseFloat(row.dataset.retDur);
+    const legMatch = !maxLeg || ((isNaN(outH) || outH <= maxLeg) &&
+                                 (isNaN(retH) || retH <= maxLeg));
+    const match = sourceMatch && legMatch &&
       (!origin || row.dataset.origin === origin) &&
       Number(row.dataset.days) >= minDays && Number(row.dataset.days) <= maxDays;
     if (match) matching++;
@@ -2819,6 +2839,7 @@ document.getElementById('filter-origin').addEventListener('change', applyFilters
 document.getElementById('filter-source').addEventListener('change', applyFilters);
 document.getElementById('filter-days-min').addEventListener('input', applyFilters);
 document.getElementById('filter-days-max').addEventListener('input', applyFilters);
+document.getElementById('filter-leg-max').addEventListener('input', applyFilters);
 const ITINS = __ITINS__;
 function fdate(iso) {
   return new Date(iso + 'T12:00:00').toLocaleDateString('en-GB',

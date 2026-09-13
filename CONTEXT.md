@@ -118,7 +118,10 @@ Other validation errors (e.g. ReturnValidationError) still count as failures.
 - Itinerary keys are asserted unique. OJ generation is independent of the RT
   destination loop, so every OJ combination is generated once.
 - `[ranking].max_leg_hours` excludes options with a known leg over 30 hours; the
-  cheapest eligible option is selected from each Google response.
+  cheapest eligible option is selected from each Google response. OTA deals with legs
+  up to `[ranking].max_leg_hours_display` (48) are still stored and ranked — the
+  browser's "Max leg h" filter (`[ranking].max_leg_filter_hours`, default 24) hides
+  them by default so cheap-but-slow OTA itineraries can be found manually.
 
 ## Skyscanner pipeline (secondary source)
 
@@ -219,7 +222,9 @@ Other validation errors (e.g. ReturnValidationError) still count as failures.
 ## HTML page (results.html)
 
 Template string `TEMPLATE` in flight_search.py, placeholders `__*__` replaced in
-render_html. Single merged ranking table (RT/OJ/SS mixed, sorted by total):
+render_html. Page order: header → toolbar (EUR/HUF toggle + ALL filters) → ranking
+table → summary cards → stats strip → foot notes → charts. Single merged ranking
+table (RT/OJ/SS mixed, sorted by total):
 columns # / Type (badge; SS rows add "via <agent>", plus a bold "indicative, checked
 Xh ago" note when stale) / Route / Outbound / Return / Days / Outbound leg / Return leg
 (RT: real paired return when available, else ≈ reference from best one-way; SS: legs
@@ -234,8 +239,12 @@ EUR/HUF toggle (huf_per_eur), sortable headers with ▲▼ indicator (default so
 asc). Stats strip: prices tracked (by kind), date pairs checked/planned,
 newest/stalest cache age, history points, runs, this-run counts, plus Skyscanner
 coverage (checked/total pairs, stored rows, oldest check, full-sweep estimate).
-Client-side filters: departure city, source (All / Google RT+OJ / OTA Skyscanner), and
-a min/max trip-day range. Rendering keeps the top `top_n` rows per
+Client-side filters: departure city, source (All / Google RT+OJ / OTA Skyscanner),
+max leg hours (default `[ranking].max_leg_filter_hours` = 24; hides rows whose
+outbound OR return leg duration exceeds it — raise it to surface the cheap
+long-leg OTA rows stored up to `max_leg_hours_display`), and a min/max trip-day
+range. Rows carry `data-out-dur`/`data-ret-dur` for the filter; legs without a
+known duration always pass. Rendering keeps the top `top_n` rows per
 `(departure city, trip days)` bucket, then the browser displays at most `top_n`
 matching rows under the active filters and sort order.
 Summary cards: cheapest overall / round trip / open jaw / OTA (Skyscanner).
