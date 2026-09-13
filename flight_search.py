@@ -355,6 +355,7 @@ def _parse_skyscanner_payload(body, domain):
                 "stops": leg.get("stopCount", 0),
                 "dep": leg.get("departure", "")[:16],
                 "arr": leg.get("arrival", "")[:16],
+                "dur_min": leg.get("durationInMinutes"),
                 "carriers": [
                     c.get("name", "")
                     for c in leg.get("carriers", {}).get("marketing", [])
@@ -466,6 +467,7 @@ def run_skyscanner_if_due(cfg, conn, args, itins):
         return
     if args.no_skyscanner or getattr(args, "rank_only", False):
         return
+    s = cfg["search"]
     last = conn.execute(
         "SELECT value FROM state WHERE key='skyscanner_last_run'"
     ).fetchone()
@@ -480,46 +482,82 @@ def run_skyscanner_if_due(cfg, conn, args, itins):
             return
     seen = set()
     combos = []
+
+    def _combo(it):
+        return (it["out_origin"], it["in_city"], it["d1"], it["d2"])
+
+    n_total = sk_cfg.get("combos", 10)
+    n_google = min(4, max(2, n_total // 3))
+    by_origin = {}
     for it in itins:
         if it["kind"] != "RT":
             continue
-        key = (it["out_origin"], it["in_city"], it["d1"], it["d2"])
+        key = _combo(it)
         if key in seen:
             continue
-        seen.add(key)
-        combos.append((it["out_origin"], it["in_city"], it["d1"], it["d2"]))
-        if len(combos) >= 3:
-            break
+        by_origin.setdefault(it["out_origin"], []).append((it["total"], key))
+    for origin in s["origins"]:
+        taken = 0
+        for _, key in sorted(by_origin.get(origin, [])):
+            if key in seen:
+                continue
+            seen.add(key)
+            combos.append(key)
+            taken += 1
+            if taken >= 2:
+                break
     n_google = len(combos)
-    n_total = sk_cfg.get("combos", 6)
+
     n_discovery = max(0, n_total - n_google)
 
     if n_discovery:
-        oj_map = {}
-        for it in itins:
-            if it["kind"] != "OJ":
-                continue
-            key = (it["out_origin"], it["in_city"], it["d1"], it["d2"])
-            cur = oj_map.get(key)
-            if cur is None or it["airfare"] < cur:
-                oj_map[key] = it["airfare"]
-        rt_map = {}
-        for it in itins:
-            if it["kind"] != "RT":
-                continue
-            key = (it["out_origin"], it["in_city"], it["d1"], it["d2"])
-            rt_map.setdefault(key, it["airfare"])
-        gaps = []
-        for key, oj_price in oj_map.items():
-            rt_price = rt_map.get(key)
-            if rt_price is None:
-                continue
-            gaps.append((rt_price - oj_price, key))
-        gaps.sort(reverse=True)
         existing = {
             (r[0], r[1], r[2], r[3])
             for r in conn.execute("SELECT origin, dest, d1, d2 FROM skyscanner_prices")
         }
+
+        winner_adjacent = []
+        for r in conn.execute(
+            "SELECT origin, dest, d1, d2, deals_json FROM skyscanner_prices"
+        ):
+            deals = json.loads(r[4])
+            if not deals:
+                continue
+            best = min(d["eur"] for d in deals)
+            g = conn.execute(
+                "SELECT MIN(price) FROM price_cache WHERE kind='RT' AND origin=? AND dest=? AND d1=? AND d2=?",
+                (r[0], r[1], r[2], r[3]),
+            ).fetchone()[0]
+            if g is not None and g - best > 100:
+                from datetime import datetime as _dt
+
+                d1d = date.fromisoformat(r[2])
+                d2d = date.fromisoformat(r[3])
+                for k in (1, 2, 3):
+                    candidate = (
+                        r[0],
+                        r[1],
+                        (d1d + timedelta(days=k)).isoformat(),
+                        (d2d + timedelta(days=k)).isoformat(),
+                    )
+                    if candidate not in seen and candidate not in existing:
+                        winner_adjacent.append(candidate)
+        combos.extend(winner_adjacent[:2])
+
+        oj_map = {}
+        rt_map = {}
+        for it in itins:
+            key = _combo(it)
+            if it["kind"] == "OJ":
+                cur = oj_map.get(key)
+                if cur is None or it["airfare"] < cur:
+                    oj_map[key] = it["airfare"]
+            elif it["kind"] == "RT":
+                rt_map.setdefault(key, it["airfare"])
+        gaps = sorted(
+            ((rt_map[k] - v, k) for k, v in oj_map.items() if k in rt_map),
+            reverse=True,
+        )
         cursor = 0
         cur_row = conn.execute(
             "SELECT value FROM state WHERE key='skyscanner_discover_cursor'"
@@ -535,22 +573,23 @@ def run_skyscanner_if_due(cfg, conn, args, itins):
             for gap, key in ordered:
                 if len(combos) >= n_total:
                     break
-                if key in existing or key in combos:
+                if key in existing or key in seen:
                     continue
                 if gap <= 50:
                     break
+                seen.add(key)
                 combos.append(key)
         conn.execute(
             "INSERT INTO state (key, value) VALUES ('skyscanner_discover_cursor', ?)"
             " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (str(cursor + n_discovery),),
         )
-        log.info(
-            "skyscanner combos: %d from google top + %d gap-discovery "
-            "(largest RT-OJ gaps, rotating)",
-            n_google,
-            len(combos) - n_google,
-        )
+    log.info(
+        "skyscanner combos: %d google-top (origin-balanced) + %d discovery"
+        " (winner-adjacent + largest RT-OJ gaps)",
+        n_google,
+        len(combos) - n_google,
+    )
     if not combos:
         return
     log.info("skyscanner spot-check starting for %d combos", len(combos))
@@ -1010,7 +1049,72 @@ def load_rows(conn):
     return rows
 
 
-def build_itineraries(cfg, rows):
+def _ss_itineraries(cfg, ss_rows, rt_prices):
+    """Synthesize itineraries from Skyscanner deals, merged into the ranking.
+    Only deals cheaper than the Google round-trip for the same pair are kept."""
+    out = []
+    for origin, dest, d1, d2, total_results, deals_json in ss_rows:
+        deals = json.loads(deals_json)
+        if not deals:
+            continue
+        g = rt_prices.get((origin, dest, d1, d2))
+        for deal in deals[:2]:
+            eur = deal.get("eur")
+            if eur is None or (g is not None and eur >= g):
+                continue
+            leg_details = []
+            for leg in deal["legs"]:
+                dep, arr = leg.get("dep", ""), leg.get("arr", "")
+                plus = 0
+                dur_h = None
+                if dep and arr:
+                    d1d = datetime.fromisoformat(dep)
+                    d2d = datetime.fromisoformat(arr)
+                    plus = (d2d.date() - d1d.date()).days
+                    if leg.get("dur_min"):
+                        dur_h = round(leg["dur_min"] / 60, 1)
+                leg_details.append(
+                    {
+                        "route": f"{leg['from']} -> {leg['to']}",
+                        "stops": leg.get("stops", 0),
+                        "dep": dep[11:16] or None,
+                        "arr": arr[11:16] or None,
+                        "plus": plus,
+                        "dur_h": dur_h,
+                        "airlines": [c for c in leg.get("carriers", []) if c],
+                        "airports": {},
+                    }
+                )
+            while len(leg_details) < 2:
+                leg_details.append(None)
+            tr_total, tr_items = transfers_for("RT", origin, origin, cfg)
+            agent = ", ".join(deal.get("agents", [])[:1])
+            out.append(
+                {
+                    "key": f"SS|{origin}|{dest}|{d1}|{d2}|{deal['price_fmt']}",
+                    "kind": "SS",
+                    "out_origin": origin,
+                    "ret_dest": origin,
+                    "in_city": dest,
+                    "out_city": dest,
+                    "d1": d1,
+                    "d2": d2,
+                    "airfare": eur,
+                    "out_detail": leg_details[0],
+                    "ret_detail": leg_details[1],
+                    "ret_unavailable": False,
+                    "transfers": tr_total,
+                    "transfer_items": tr_items,
+                    "agent": agent,
+                    "link": deal.get("link"),
+                }
+            )
+    for it in out:
+        it["total"] = it["airfare"] + it["transfers"]
+    return out
+
+
+def build_itineraries(cfg, rows, ss_rows=None):
     s = cfg["search"]
     start = date.fromisoformat(s["date_start"])
     end = date.fromisoformat(s["date_end"])
@@ -1086,6 +1190,13 @@ def build_itineraries(cfg, rows):
                             )
     for it in itins:
         it["total"] = it["airfare"] + it["transfers"]
+    if ss_rows:
+        rt_prices = {}
+        for it in itins:
+            if it["kind"] == "RT":
+                key = (it["out_origin"], it["in_city"], it["d1"], it["d2"])
+                rt_prices.setdefault(key, it["airfare"])
+        itins.extend(_ss_itineraries(cfg, ss_rows, rt_prices))
     itins.sort(key=lambda x: x["total"])
     return itins
 
@@ -1177,9 +1288,14 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
 
     rows_html = []
     shown_json = []
+    ss_domain = cfg.get("skyscanner", {}).get("domain", "skyscanner.hu")
     for i, it in enumerate(shown, 1):
         o, r = it["out_detail"], it["ret_detail"]
-        kind_label = "Round trip" if it["kind"] == "RT" else "Open jaw"
+        kind_label = {
+            "RT": "Round trip",
+            "OJ": "Open jaw",
+            "SS": "Round trip · OTA",
+        }[it["kind"]]
         route_txt = f"{it['out_origin']} → {it['in_city']} · {it['out_city']} → {it['ret_dest']}"
         delta = ""
         if it["key"] in prev and prev[it["key"]] != it["total"]:
@@ -1196,20 +1312,34 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
             None if it["kind"] == "OJ" else it["d2"],
             cfg,
         )
-        gf_links.append(q1.url())
+        gf_links.append(("Google", q1.url()))
         if it["kind"] == "OJ":
             q2 = build_query("OW", it["out_city"], it["ret_dest"], it["d2"], None, cfg)
-            gf_links.append(q2.url())
+            gf_links.append(("Google", q2.url()))
+        if it["kind"] == "SS":
+            gf_links.append(
+                (
+                    "Skyscanner",
+                    _ss_url(
+                        it["out_origin"], it["in_city"], it["d1"], it["d2"], ss_domain
+                    ),
+                )
+            )
         links = " ".join(
-            f'<a class="gf" href="{u}" target="_blank" rel="noopener">GF{i + 1} ↗</a>'
-            for i, u in enumerate(gf_links)
+            f'<a class="gf" href="{u}" target="_blank" rel="noopener">{name} ↗</a>'
+            for name, u in gf_links
         )
         tr_items = "; ".join(f"{n} ({v:.0f})" for n, v in it["transfer_items"])
         idx = i - 1
-        badge_cls = "badge" if it["kind"] == "RT" else "badge oj"
+        badge_cls = "badge" if it["kind"] in ("RT", "SS") else "badge oj"
+        agent_html = (
+            f'<br><small class="muted">via {html.escape(it.get("agent", ""))}</small>'
+            if it["kind"] == "SS"
+            else ""
+        )
         rows_html.append(
             f'<tr data-eur-total="{it["total"]:.2f}" data-i="{idx}" title="click for details">'
-            f'<td class="rank">{i}</td><td><span class="{badge_cls}">{kind_label}</span></td><td>{route_txt}</td>'
+            f'<td class="rank">{i}</td><td><span class="{badge_cls}">{kind_label}</span>{agent_html}</td><td>{route_txt}</td>'
             f"<td>{fmt_date(it['d1'])}</td><td>{fmt_date(it['d2'])}</td>"
             f'<td class="num">{(date.fromisoformat(it["d2"]) - date.fromisoformat(it["d1"])).days}</td>'
             f"{leg_cell(o)}"
@@ -1358,51 +1488,6 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
             f"<b>{value}</b> {html.escape(label)} {sub_html}</span>"
         )
 
-    ss_rows = conn.execute(
-        "SELECT origin, dest, d1, d2, total_results, deals_json, fetched_at"
-        " FROM skyscanner_prices ORDER BY fetched_at DESC"
-    ).fetchall()
-    ss_html = ""
-    if ss_rows:
-        cells = []
-        for origin, dest, d1, d2, total, deals_json, fetched_at in ss_rows[:8]:
-            deals = json.loads(deals_json)
-            if not deals:
-                continue
-            best = deals[0]
-            st = best.get("self_transfer") or any(d.get("self_transfer") for d in deals)
-            badge = (
-                '<span class="badge oj">self-transfer</span>'
-                if st
-                else '<span class="badge">direct tickets</span>'
-            )
-            deal = deals[0]
-            alt = ", ".join(f"{d['price_fmt']}" for d in deals[1:4])
-            cells.append(
-                f"<tr>"
-                f"<td>{origin} → {dest}</td>"
-                f"<td>{fmt_date(d1)}<br><small>{fmt_date(d2)}</small></td>"
-                f'<td class="num" data-eur="{deal["eur"]:.0f}">{deal["eur"]:.0f}</td>'
-                f"<td><small>{html.escape(deal['price_fmt'])}</small></td>"
-                f"<td><small>{html.escape(', '.join(deal['agents'][:2]) or '?')}</small></td>"
-                f"<td>{badge}</td>"
-                f'<td><a class="gf" href="{deal["link"]}" target="_blank" rel="noopener">book ↗</a></td>'
-                f"</tr>"
-            )
-        if cells:
-            ss_html = (
-                '<h3 style="margin:18px 0 8px;font-size:.95rem">Skyscanner &amp; OTA deals '
-                '<small class="muted">(separate tickets / self-transfer — book via agents,'
-                " not on Google; EUR approximated from raw currency)</small></h3>"
-                '<div class="panel table-wrap"><table><thead><tr>'
-                "<th>Route</th><th>Dates</th><th>Price</th><th>Original</th>"
-                "<th>Agent</th><th>Type</th><th>Link</th></tr></thead><tbody>"
-                + "".join(cells)
-                + "</tbody></table></div>"
-            )
-    else:
-        ss_html = ""
-
     html_doc = TEMPLATE
     html_doc = html_doc.replace("__RUN_TS__", run_ts)
     html_doc = html_doc.replace("__HUF__", str(huf))
@@ -1413,7 +1498,6 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
         + card("Cheapest open jaw", best_oj),
     )
     html_doc = html_doc.replace("__STATS__", stats_html)
-    html_doc = html_doc.replace("__SKYSCANNER__", ss_html)
     html_doc = html_doc.replace("__ROWS__", "\n".join(rows_html))
     html_doc = html_doc.replace("__ITINS__", json.dumps(shown_json, ensure_ascii=False))
     html_doc = html_doc.replace("__CHART_DATA__", json.dumps(chart_data))
@@ -1598,7 +1682,6 @@ __ROWS__
   <div class="chart-box"><h3>Top itineraries &mdash; total price over runs</h3><canvas id="c1"></canvas></div>
   <div class="chart-box"><h3>Cheapest overall over runs</h3><canvas id="c2"></canvas></div>
  </div>
- __SKYSCANNER__
 </div>
 <dialog id="dlg">
  <div class="dlg-head">
@@ -1706,8 +1789,9 @@ function showDetails(it) {
   ];
   const costs = rows.map(([n, v]) =>
     `<tr><td>${n}</td><td>${v}</td></tr>`).join('');
-  const links = it.gf_links.map((u, i) =>
-    `<a href="${u}" target="_blank" rel="noopener">Google Flights ${it.gf_links.length > 1 ? i + 1 : ''}</a>`).join('');
+  const links = it.gf_links
+    .map(([name, u]) => `<a href="${u}" target="_blank" rel="noopener">${esc(name)}</a>`)
+    .join('');
   document.getElementById('dlg-body').innerHTML = `
     <div class="dlg-dates">${fdate(it.d1)} → ${fdate(it.d2)} · ${it.days} days · price per person</div>
     ${legHtml(it.out, 'Outbound')}
@@ -1748,7 +1832,7 @@ apply();
 
 
 def label_itins(itins):
-    labels = {"RT": "Round trip", "OJ": "Open jaw"}
+    labels = {"RT": "Round trip", "OJ": "Open jaw", "SS": "Skyscanner RT"}
     for it in itins:
         direction = f"{it['in_city']}/{it['out_city']}"
         it["label"] = (
@@ -1759,7 +1843,11 @@ def label_itins(itins):
 
 def refresh_html(cfg, conn, args, run_ts, progress):
     rows = load_rows(conn)
-    itins = build_itineraries(cfg, rows)
+    ss_rows = conn.execute(
+        "SELECT origin, dest, d1, d2, total_results, deals_json FROM skyscanner_prices"
+        " ORDER BY fetched_at DESC"
+    ).fetchall()
+    itins = build_itineraries(cfg, rows, ss_rows)
     label_itins(itins)
     prev, prev_ts = prev_totals(conn)
     html_doc = render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress)
@@ -1782,8 +1870,12 @@ def main():
     itins = build_itineraries(cfg, rows)
     label_itins(itins)
     run_skyscanner_if_due(cfg, conn, args, itins)
+    ss_rows = conn.execute(
+        "SELECT origin, dest, d1, d2, total_results, deals_json FROM skyscanner_prices"
+        " ORDER BY fetched_at DESC"
+    ).fetchall()
     rows = load_rows(conn)
-    itins = build_itineraries(cfg, rows)
+    itins = build_itineraries(cfg, rows, ss_rows)
     label_itins(itins)
     prev, prev_ts = prev_totals(conn)
     log.info(
