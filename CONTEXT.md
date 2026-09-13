@@ -28,10 +28,10 @@ MUST be updated whenever behavior, schema, config, or pipeline changes.**
 
 ## Environment
 
-- Python 3.14 venv at `./venv` (NOTE: venv bin scripts have a stale shebang pointing to
-  the pre-rename dir `$HOME/Work/japan`; always invoke via
+- Python 3.14 venv at `./venv` (NOTE: venv bin scripts may retain a stale shebang after
+  a repository rename; always invoke via
   `./venv/bin/python -m pip ...` or `./venv/bin/python script.py`).
-- Repo dir was renamed `$HOME/Work/japan` → `$HOME/Work/japan-trips`.
+- The repository directory was previously renamed; do not rely on venv script shebangs.
 - GitHub: repo `la55u/japan-trips`, Pages at
   https://la55u.github.io/japan-trips/ (branch `main`, root, `index.html` redirects).
 - Local test DB `flights_local.db` was seeded from `flights.db` once; it diverges.
@@ -206,6 +206,27 @@ hourly → full window (1708 queries) targets a ~4h refresh. Oldest stale rows a
 selected first and the report distinguishes fresh from deferred stale work. The shared
 gate enforces ~2 HTTP requests/s across workers and real cooldowns block workers.
 `workflow_dispatch` supports manual runs.
+
+### Local scheduler watchdog
+
+- `watchdog.py` is a stdlib-only script invoked by a systemd user timer. It calls the
+  authenticated `/usr/bin/gh`; it never runs the scanner or writes local flight data.
+- Default policy: check up to 20 recent `scan.yml` runs, dispatch when the latest
+  success is older than 75 minutes, skip if any run is active, and suppress another
+  dispatch until the latest attempt is at least 30 minutes old.
+- A nonblocking `fcntl` lock at `/tmp/japan-trips-watchdog-<uid>.lock` prevents overlap.
+  `--dry-run` performs the GitHub read but never dispatches.
+- Version-controlled units live in `systemd/japan-trips-watchdog.{service,timer}` and
+  are linked into the user manager. The timer runs every 10 minutes, uses
+  `Persistent=true`, and logs to the user journal. The service sets `HOME` and absolute
+  binary paths so `gh` finds `~/.config/gh/hosts.yml`.
+- User lingering must be enabled for checks to continue after logout. No local timer
+  can execute while the machine is powered off; persistent timers catch up at startup.
+- Permanent machine removal: disable/stop the timer, remove both linked units from
+  `~/.config/systemd/user/`, then run `systemctl --user daemon-reload` and
+  `reset-failed`. Run `loginctl disable-linger "$USER"` only if no other user service
+  needs lingering. This removes the installation but deliberately preserves repository
+  files and shared-journal history; README.md contains the exact commands and checks.
 
 ## Google blocking model (empirical)
 

@@ -3,3 +3,11 @@ __pycache__/
 *.pyc
 flights_local.db
 results_local.html
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.log
+credentials.json
+secrets.json

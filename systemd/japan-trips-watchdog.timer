@@ -1,0 +1,12 @@
+[Unit]
+Description=Check the Japan trips workflow every 10 minutes
+
+[Timer]
+OnStartupSec=2min
+OnUnitActiveSec=10min
+Persistent=true
+RandomizedDelaySec=30s
+Unit=japan-trips-watchdog.service
+
+[Install]
+WantedBy=timers.target

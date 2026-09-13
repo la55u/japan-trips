@@ -117,10 +117,86 @@ GitHub Pages redeploys automatically. `flights.db` is committed so price history
 deltas accumulate across runs; it is written **only by CI** (see "Local vs CI data").
 Manual runs: *Actions → scan → Run workflow*.
 
+### Local watchdog
+
+`watchdog.py` compensates for dropped GitHub cron events. It checks the latest workflow
+runs and dispatches `scan.yml` when the latest success is older than 75 minutes. It
+does nothing while a run is active and waits 30 minutes after any recent attempt before
+retrying, preventing dispatch storms during failures.
+
+It uses the authenticated GitHub CLI and can be checked without dispatching anything:
+
+```bash
+gh auth status
+./watchdog.py --dry-run
+```
+
+The repository includes a systemd user service and timer, so no cron package is needed.
+Link and enable them with:
+
+```bash
+systemctl --user link "$PWD/systemd/japan-trips-watchdog.service"
+systemctl --user link "$PWD/systemd/japan-trips-watchdog.timer"
+systemctl --user daemon-reload
+systemctl --user enable --now japan-trips-watchdog.timer
+```
+
+Enable user lingering so the timer continues after logout:
+
+```bash
+loginctl enable-linger "$USER"
+```
+
+Inspect it with `systemctl --user list-timers japan-trips-watchdog.timer` and
+`journalctl --user -u japan-trips-watchdog.service`. `Persistent=true` runs a missed
+check after the user manager starts again, although no local timer can run while the
+machine is powered off.
+
+To remove the installed watchdog permanently from this machine:
+
+```bash
+systemctl --user disable --now japan-trips-watchdog.timer
+rm -f "$HOME/.config/systemd/user/japan-trips-watchdog.timer"
+rm -f "$HOME/.config/systemd/user/japan-trips-watchdog.service"
+systemctl --user daemon-reload
+systemctl --user reset-failed
+```
+
+The first command removes the `timers.target.wants` enablement link; the two `rm`
+commands remove the unit links created by `systemctl --user link`. If lingering was
+enabled only for this watchdog and no other user services need to run after logout,
+disable it separately:
+
+```bash
+loginctl disable-linger "$USER"
+```
+
+Do not disable lingering if another user service depends on it. Confirm removal with:
+
+```bash
+systemctl --user is-active japan-trips-watchdog.timer
+systemctl --user is-enabled japan-trips-watchdog.timer
+```
+
+Both checks should report `inactive`, `disabled`, or `not-found`. These commands remove
+only the local installation; they intentionally leave `watchdog.py`, its tests, and the
+version-controlled unit files in the repository. Removing the feature from the
+repository as well requires deleting those files, removing them from the CI Ruff
+command, and deleting this documentation. The watchdog does not create a dedicated log
+file: historical output remains in the shared user journal and expires according to
+the machine's normal journald retention policy.
+
+Useful overrides are `--max-age-minutes`, `--retry-cooldown-minutes`, `--repo`,
+`--workflow`, and `--ref`. A lock file in `/tmp` prevents overlapping watchdog
+processes. The watchdog only dispatches GitHub Actions; it never modifies the local
+database or report.
+
 ## Files
 
 - `flight_search.py` — search, ranking, HTML generation (single file).
 - `test_flight_search.py` — ranking, failure-handling, DB, and source regression tests.
+- `watchdog.py`, `test_watchdog.py` — local watchdog and its decision tests.
+- `systemd/` — user service and 10-minute timer for the watchdog.
 - `config.toml` — all settings.
 - `flights.db` — CI-owned SQLite cache + price history (committed).
 - `results.html` — generated report deployed via GitHub Pages.

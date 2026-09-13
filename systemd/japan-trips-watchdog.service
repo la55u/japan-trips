@@ -1,0 +1,10 @@
+[Unit]
+Description=Japan trips GitHub Actions watchdog
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=HOME=%h
+Environment=PATH=/usr/local/bin:/usr/bin
+ExecStart=/usr/bin/python3 %h/Work/japan-trips/watchdog.py --gh-bin /usr/bin/gh
