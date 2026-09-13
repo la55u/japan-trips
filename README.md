@@ -26,8 +26,19 @@ Each itinerary's **total per-person cost** = airfare + estimated transfers:
 
 Everything lives in `config.toml`. Google and Skyscanner are queried for **2 adults**;
 party totals are divided to show per-person prices. Google requests economy, one
-checked bag, and max 2 stops by default. OTA rows add a conservative configured bag
-estimate because Skyscanner does not provide a verified bag-inclusive quote.
+checked bag, and max 2 stops by default. OTA rows are ranked independently of Google:
+the table shows both the raw OTA fare and the fare plus a conservative configured bag
+estimate, because Skyscanner does not provide a verified bag-inclusive quote.
+
+Skyscanner is spot-checked through an anti-fingerprint browser at most every 3 hours in
+three tiers with per-combination refresh times: **hot** (refresh current winners),
+**neighbours** (±1–3 days around stored deals that beat Google), and **exploration**
+(unseen pairs first, then oldest checked, balanced across routes and trip durations —
+around 50 pairs/run, a full window sweep in under a week). Rows older than a day are
+labelled *indicative*; the stats strip shows Skyscanner coverage (pairs checked, oldest
+check, estimated full-sweep time). Optionally, a Travelpayouts Data API token
+(`[travelpayouts]`) enables cached calendar prices to prioritize which exploration
+pairs get checked — they are never shown or ranked.
 
 ## Setup
 
@@ -69,10 +80,11 @@ push promptly (the DB is a binary file and cannot merge).
 
 ## Output (`results.html`)
 
-- Summary cards: cheapest overall / round trip / open jaw.
+- Summary cards: cheapest overall / round trip / open jaw / OTA (Skyscanner).
 - Top-40 table, sortable by any column (▲/▼ indicator), EUR/HUF toggle, departure-city
-  selector, and minimum/maximum trip-day filters. The report retains enough candidates
-  to show the best 40 for every configured city/day combination.
+  selector, source filter (Google / OTA), and minimum/maximum trip-day filters. The
+  report retains enough candidates to show the best 40 for every configured city/day
+  combination.
 - Legs show route (hover airport codes for full names), local departure/arrival times,
   `(+n)` = arrival n days after departure, total duration in hours incl. layovers, stops,
   airlines, and Google Flights links to verify/book.

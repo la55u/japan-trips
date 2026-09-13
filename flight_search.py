@@ -41,6 +41,11 @@ class ReturnValidationError(RuntimeError):
     pass
 
 
+class TooLongError(RuntimeError):
+    """Every returned itinerary exceeds the configured max leg duration —
+    a valid (confirmed) Google response that just has no bookable option."""
+
+
 class RequestGate:
     def __init__(self, requests_per_second: float):
         self.interval = 1 / max(requests_per_second, 0.1)
@@ -834,8 +839,131 @@ def _ss_eur(price_raw, currency, huf_per_eur, eur_per_gbp):
     raise ValueError(f"unsupported Skyscanner currency: {currency}")
 
 
+def _ss_universe(cfg):
+    """Every RT route/date combination Skyscanner could ever check — the same
+    enumeration as the RT part of plan_queries."""
+    s = cfg["search"]
+    start = date.fromisoformat(s["date_start"])
+    end = date.fromisoformat(s["date_end"])
+    step = s.get("step_days", 1)
+    out = []
+    d = start
+    while d <= end - timedelta(days=s["trip_min_days"]):
+        for origin in s["origins"]:
+            for dest in s["destinations"]:
+                for dur in range(s["trip_min_days"], s["trip_max_days"] + 1):
+                    d2 = d + timedelta(days=dur)
+                    if d2 > end:
+                        continue
+                    out.append((origin, dest, d.isoformat(), d2.isoformat()))
+        d += timedelta(days=step)
+    return out
+
+
+def _travelpayouts_cheap_pairs(cfg):
+    """Optional discovery booster: query the Travelpayouts Data API
+    (aviasales v3 prices_for_dates, i.e. cached calendar prices) and return
+    {(origin, dest, d1, d2): price_eur} for pairs inside the scan window.
+    Cached data is NOT reliable as a final live price — it is only used to
+    prioritize Skyscanner exploration checks. Never raises."""
+    tp = cfg.get("travelpayouts", {})
+    if not tp.get("enabled") or not tp.get("token"):
+        return {}
+    s = cfg["search"]
+    start = date.fromisoformat(s["date_start"])
+    end = date.fromisoformat(s["date_end"])
+    result = {}
+    import urllib.parse
+    import urllib.request
+
+    for origin in s["origins"]:
+        for dest in s["destinations"]:
+            params = {
+                "origin": origin,
+                "destination": dest,
+                "currency": "eur",
+                "sorting": "price",
+                "direct": "false",
+                "limit": 30,
+                "one_way": "false",
+                "token": tp["token"],
+            }
+            url = (
+                "https://api.travelpayouts.com/aviasales/v3/prices_for_dates?"
+                + urllib.parse.urlencode(params)
+            )
+            try:
+                with urllib.request.urlopen(url, timeout=20) as resp:
+                    data = json.load(resp)
+                for entry in data.get("data", []):
+                    d1 = str(entry.get("depart_date", ""))[:10]
+                    d2 = str(entry.get("return_date") or "")[:10]
+                    price = entry.get("price")
+                    if not d1 or not d2 or not price:
+                        continue
+                    try:
+                        dep = date.fromisoformat(d1)
+                        ret = date.fromisoformat(d2)
+                    except ValueError:
+                        continue
+                    if not (
+                        start <= dep < ret <= end
+                        and s["trip_min_days"] <= (ret - dep).days <= s["trip_max_days"]
+                    ):
+                        continue
+                    key = (origin, dest, d1, d2)
+                    prev = result.get(key)
+                    if prev is None or price < prev:
+                        result[key] = float(price)
+            except Exception as e:  # noqa: BLE001 - discovery source is best effort
+                log.warning(
+                    "travelpayouts %s->%s failed: %s", origin, dest, str(e)[:120]
+                )
+    if result:
+        log.info(
+            "travelpayouts calendar shortlisted %d promising date pairs", len(result)
+        )
+    return result
+
+
+def _select_exploration(due, n):
+    """Pick `n` exploration combos oldest-successful-first with round-robin
+    quotas per route (origin,dest) and per trip duration. `due` is a list of
+    (sort_key, combo) already ordered so that earlier entries are preferred."""
+    by_route_dur = {}
+    for sort_key, combo in due:
+        route = (combo[0], combo[1])
+        dur = (date.fromisoformat(combo[3]) - date.fromisoformat(combo[2])).days
+        by_route_dur.setdefault((route, dur), []).append((sort_key, combo))
+    for lst in by_route_dur.values():
+        lst.sort()
+    picked = []
+    cells = sorted(by_route_dur)
+    idx = 0
+    while len(picked) < n and cells:
+        route, dur = cells[idx % len(cells)]
+        bucket = by_route_dur[(route, dur)]
+        if bucket:
+            picked.append(bucket.pop(0)[1])
+        if not bucket:
+            cells.pop(idx % len(cells))
+            if not cells:
+                break
+            continue
+        idx += 1
+    return picked
+
+
 def run_skyscanner_if_due(cfg, conn, args, itins):
-    """Run the Skyscanner spot-check when due; store results in the DB."""
+    """Run the Skyscanner spot-check when due; store results in the DB.
+
+    Tiered scheduling with per-combination refresh times (skyscanner_attempts
+    last_success_at), run at most every min_age_hours:
+    - hot: refresh stored winners (cheapest deals) older than hot_refresh_hours
+    - neighbours: ±1..3-day shifts around stored deals that beat Google by >100
+    - exploration: unseen pairs first, then oldest successful check, balanced
+      across routes and trip durations; Travelpayouts calendar pairs (if
+      configured) are prioritized within each bucket."""
     sk_cfg = cfg.get("skyscanner", {})
     if not sk_cfg.get("enabled", False):
         return
@@ -845,144 +973,153 @@ def run_skyscanner_if_due(cfg, conn, args, itins):
     adults = s.get("adults", 2)
     state_suffix = f"v{CACHE_VERSION}_{adults}"
     last_run_key = f"skyscanner_last_run_{state_suffix}"
-    cursor_key = f"skyscanner_discover_cursor_{state_suffix}"
     last = conn.execute(
         "SELECT value FROM state WHERE key=?", (last_run_key,)
     ).fetchone()
     if last:
         age = _age_hours(last[0])
-        if age is not None and age < sk_cfg.get("min_age_hours", 20):
+        if age is not None and age < sk_cfg.get("min_age_hours", 3):
             log.info(
                 "skyscanner spot-check skipped (last run %.1fh ago, min %dh)",
                 age,
-                sk_cfg.get("min_age_hours", 20),
+                sk_cfg.get("min_age_hours", 3),
             )
             return
-    seen = set()
-    combos = []
+
+    n_hot = sk_cfg.get("hot_combos", 15)
+    n_explore = sk_cfg.get("explore_combos", 25)
+    n_neighbour = sk_cfg.get("neighbour_combos", 10)
+    hot_refresh = sk_cfg.get("hot_refresh_hours", 18)
+    explore_refresh = sk_cfg.get("explore_refresh_hours", 120)
+
+    attempts = {}
+    for key, last_success, last_attempt in conn.execute(
+        "SELECT key, last_success_at, last_attempt_at FROM skyscanner_attempts "
+        "WHERE key LIKE ?",
+        (f"{state_suffix}|%",),
+    ):
+        parts = key.split("|", 1)
+        if len(parts) == 2:
+            attempts[tuple(parts[1].split("|"))] = (last_success, last_attempt)
 
     def _combo(it):
         return (it["out_origin"], it["in_city"], it["d1"], it["d2"])
 
-    n_total = sk_cfg.get("combos", 10)
-    n_google = min(4, max(2, n_total // 3))
-    by_origin = {}
-    for it in itins:
-        if it["kind"] != "RT":
-            continue
-        key = _combo(it)
-        if key in seen:
-            continue
-        by_origin.setdefault(it["out_origin"], []).append((it["total"], key))
-    for origin in s["origins"]:
-        taken = 0
-        for _, key in sorted(by_origin.get(origin, [])):
-            if key in seen:
-                continue
-            seen.add(key)
-            combos.append(key)
-            taken += 1
-            if taken >= 2:
-                break
-    n_google = len(combos)
-
-    n_discovery = max(0, n_total - n_google)
-    cursor = 0
-
-    oj_map = {}
     rt_map = {}
     for it in itins:
         key = _combo(it)
-        if it["kind"] == "OJ":
-            cur = oj_map.get(key)
-            if cur is None or it["airfare"] < cur:
-                oj_map[key] = it["airfare"]
-        elif it["kind"] == "RT":
+        if it["kind"] == "RT":
             rt_map.setdefault(key, it["airfare"])
 
-    if n_discovery:
-        cutoff = (
-            datetime.now(timezone.utc)
-            - timedelta(hours=sk_cfg.get("max_age_hours", 36))
-        ).strftime("%Y-%m-%dT%H:%M:%SZ")
-        existing = {
-            (r[0], r[1], r[2], r[3])
-            for r in conn.execute(
-                "SELECT origin, dest, d1, d2 FROM skyscanner_prices "
-                "WHERE adults=? AND fetched_at>=?",
-                (adults, cutoff),
+    stored = []
+    for row in conn.execute(
+        "SELECT origin, dest, d1, d2, deals_json, fetched_at FROM skyscanner_prices "
+        "WHERE adults=? AND deals_json IS NOT NULL",
+        (adults,),
+    ):
+        origin, dest, d1, d2, deals_json, fetched_at = row
+        if (origin, dest) not in {
+            (o, d) for o in s["origins"] for d in s["destinations"]
+        }:
+            continue
+        try:
+            deals = json.loads(deals_json)
+        except (TypeError, ValueError):
+            continue
+        eurs = [d.get("eur") for d in deals if isinstance(d, dict) and d.get("eur")]
+        if eurs:
+            stored.append(
+                {
+                    "combo": (origin, dest, d1, d2),
+                    "best_eur": min(eurs),
+                    "age": _age_hours(fetched_at),
+                }
             )
-        }
 
-        winner_adjacent = []
-        for r in conn.execute(
-            "SELECT origin, dest, d1, d2, deals_json FROM skyscanner_prices "
-            "WHERE adults=? AND fetched_at>=?",
-            (adults, cutoff),
-        ):
-            deals = json.loads(r[4])
-            if not deals:
+    combos = []
+    seen = set()
+
+    # --- hot tier: keep current winners and displayed deals fresh ---
+    hot_due = [r for r in stored if r["age"] is None or r["age"] >= hot_refresh]
+    hot_due.sort(key=lambda r: (r["best_eur"], r["age"] or 1e9))
+    for r in hot_due[:n_hot]:
+        combos.append(r["combo"])
+        seen.add(r["combo"])
+
+    # --- neighbour tier: ±1..3 days around deals that strongly beat Google ---
+    strong = []
+    for r in stored:
+        gap = rt_map.get(r["combo"])
+        if gap is not None and gap - r["best_eur"] > 100:
+            strong.append((gap - r["best_eur"], r))
+    strong.sort(key=lambda pair: pair[0], reverse=True)
+    n_neighbour_taken = 0
+    for _gap, r in strong:
+        if n_neighbour_taken >= n_neighbour:
+            break
+        d1d = date.fromisoformat(r["combo"][2])
+        d2d = date.fromisoformat(r["combo"][3])
+        for k in (-3, -2, -1, 1, 2, 3):
+            shifted_d1 = d1d + timedelta(days=k)
+            shifted_d2 = d2d + timedelta(days=k)
+            if not (
+                date.fromisoformat(s["date_start"])
+                <= shifted_d1
+                < shifted_d2
+                <= date.fromisoformat(s["date_end"])
+            ):
                 continue
-            best = min(d["eur"] for d in deals)
-            g = rt_map.get((r[0], r[1], r[2], r[3]))
-            if g is not None and g - best > 100:
-                d1d = date.fromisoformat(r[2])
-                d2d = date.fromisoformat(r[3])
-                for k in (-3, -2, -1, 1, 2, 3):
-                    shifted_d1 = d1d + timedelta(days=k)
-                    shifted_d2 = d2d + timedelta(days=k)
-                    if not (
-                        date.fromisoformat(s["date_start"])
-                        <= shifted_d1
-                        < shifted_d2
-                        <= date.fromisoformat(s["date_end"])
-                    ):
-                        continue
-                    candidate = (
-                        r[0],
-                        r[1],
-                        shifted_d1.isoformat(),
-                        shifted_d2.isoformat(),
-                    )
-                    if candidate not in seen and candidate not in existing:
-                        seen.add(candidate)
-                        winner_adjacent.append(candidate)
-        combos.extend(winner_adjacent[:2])
+            candidate = (
+                r["combo"][0],
+                r["combo"][1],
+                shifted_d1.isoformat(),
+                shifted_d2.isoformat(),
+            )
+            if candidate in seen:
+                continue
+            prev_attempt = attempts.get(candidate, (None, None))[1]
+            if prev_attempt and (_age_hours(prev_attempt) or 0) < explore_refresh:
+                continue
+            seen.add(candidate)
+            combos.append(candidate)
+            n_neighbour_taken += 1
+            break
 
-        gaps = sorted(
-            (
-                (rt_map[k] - v, k)
-                for k, v in oj_map.items()
-                if k in rt_map and rt_map[k] - v > 50
-            ),
-            reverse=True,
-        )
-        cur_row = conn.execute(
-            "SELECT value FROM state WHERE key=?", (cursor_key,)
-        ).fetchone()
-        if cur_row:
-            try:
-                cursor = int(cur_row[0])
-            except ValueError:
-                cursor = 0
-        if gaps:
-            off = cursor % len(gaps)
-            ordered = gaps[off:] + gaps[:off]
-            for gap, key in ordered:
-                if len(combos) >= n_total:
-                    break
-                if key in existing or key in seen:
-                    continue
-                seen.add(key)
-                combos.append(key)
-    log.info(
-        "skyscanner combos: %d google-top (origin-balanced) + %d discovery"
-        " (winner-adjacent + largest RT-OJ gaps)",
-        n_google,
-        len(combos) - n_google,
-    )
+    # --- exploration tier: unseen first, then oldest successful check ---
+    universe = _ss_universe(cfg)
+    tp_pairs = _travelpayouts_cheap_pairs(cfg)
+    due = []
+    for combo in universe:
+        if combo in seen:
+            continue
+        last_success, _last_attempt = attempts.get(combo, (None, None))
+        if last_success:
+            age = _age_hours(last_success)
+            if age is not None and age < explore_refresh:
+                continue
+            sort_key = (1, last_success, combo)
+        else:
+            sort_key = (0, "", combo)
+        if combo in tp_pairs:
+            sort_key = (0, f"{tp_pairs[combo]:010.2f}", combo)
+        due.append((sort_key, combo))
+    combos.extend(_select_exploration(due, n_explore))
+
+    n_hot_taken = min(len(hot_due), n_hot)
+    n_explore_taken = max(0, len(combos) - n_hot_taken - n_neighbour_taken)
     if not combos:
+        log.info("skyscanner: nothing due (hot/neighbours/exploration all fresh)")
         return
+    log.info(
+        "skyscanner combos: %d hot + %d neighbour + %d exploration"
+        " (per-combo refresh: hot %dh, exploration %dh; TP boost: %d)",
+        n_hot_taken,
+        n_neighbour_taken,
+        n_explore_taken,
+        hot_refresh,
+        explore_refresh,
+        sum(1 for c in combos if c in tp_pairs),
+    )
     log.info("skyscanner spot-check starting for %d combos", len(combos))
     try:
         rows = skyscanner_spotcheck(cfg, conn, combos)
@@ -1085,12 +1222,6 @@ def run_skyscanner_if_due(cfg, conn, args, itins):
         " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (last_run_key, attempted_at),
     )
-    if n_discovery:
-        conn.execute(
-            "INSERT INTO state (key, value) VALUES (?, ?)"
-            " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (cursor_key, str(cursor + n_discovery)),
-        )
     conn.commit()
     log.info("skyscanner spot-check stored %d combos", len(rows))
 
@@ -1231,7 +1362,7 @@ def summarize(itins, cfg):
     eligible = eligible_itineraries(itins, cfg)
     max_hours = cfg.get("ranking", {}).get("max_leg_hours", 0)
     if not eligible:
-        raise RuntimeError(f"all {len(itins)} itineraries exceed {max_hours}h")
+        raise TooLongError(f"all {len(itins)} itineraries exceed {max_hours}h")
     best = min(eligible, key=lambda f: f["price"])
     detail = dict(best)
     detail["n_results"] = len(itins)
@@ -1303,11 +1434,13 @@ def run_scan(cfg, conn, args, run_ts):
         if args.force or row is None or row[1] is None:
             stale.append((row[3] if row and row[3] else "", spec, key))
         else:
-            no_exact = row[2] is not None and "no_exact_results" in row[2]
+            confirmed = row[2] is not None and (
+                "no_exact_results" in row[2] or "too_long" in row[2]
+            )
             age = (
                 now - datetime.fromisoformat(row[1].replace("Z", "+00:00")).timestamp()
             )
-            if age > ttl or (row[0] is None and not no_exact):
+            if age > ttl or (row[0] is None and not confirmed):
                 stale.append((row[3] or row[1] or "", spec, key))
     stale.sort(key=lambda item: item[0])
     stale_total = len(stale)
@@ -1352,6 +1485,7 @@ def run_scan(cfg, conn, args, run_ts):
         "n": 0,
         "fail": 0,
         "empty": 0,
+        "too_long": 0,
         "cached": len(all_queries) - stale_total,
         "deferred": stale_total - len(todo),
         "selected": len(todo),
@@ -1382,6 +1516,7 @@ def run_scan(cfg, conn, args, run_ts):
             price = None
             detail = None
             n_results = 0
+            too_long = False
             if itins:
                 try:
                     itins = [
@@ -1458,6 +1593,17 @@ def run_scan(cfg, conn, args, run_ts):
                         except Exception as e:  # noqa: BLE001 - fare remains usable
                             log.warning("return-leg fetch failed for %s: %s", key, e)
                     detail = json.dumps(detail, ensure_ascii=False)
+                except TooLongError as e:
+                    # Confirmed Google response: every returned itinerary is
+                    # longer than the ranking limit. Record it so the row is
+                    # TTL-refreshed like a confirmed-empty one instead of
+                    # being retried every run, and never count it toward the
+                    # throttling cooldown.
+                    err = None
+                    too_long = True
+                    price = None
+                    n_results = 0
+                    detail = json.dumps({"too_long": True, "note": str(e)})
                 except Exception as e:  # noqa: BLE001 - convert to cached attempt error
                     err = f"{type(e).__name__}: {e}"
                     price = None
@@ -1485,6 +1631,19 @@ def run_scan(cfg, conn, args, run_ts):
                     price,
                     n_results,
                     json.loads(detail).get("route", "?"),
+                    elapsed,
+                )
+            elif too_long:
+                consec_fail = 0
+                with lock:
+                    progress["too_long"] += 1
+                max_hours = cfg.get("ranking", {}).get("max_leg_hours", 0)
+                log.info(
+                    "[%d/%d] %s: all returned itineraries exceed %dh (recorded), %.1fs",
+                    n,
+                    len(todo),
+                    tag,
+                    max_hours,
                     elapsed,
                 )
             elif err is None:
@@ -1592,11 +1751,13 @@ def run_scan(cfg, conn, args, run_ts):
             conn.commit()
 
     log.info(
-        "scan finished in %.0fs: fetched=%d failed=%d empty=%d fresh=%d deferred=%d",
+        "scan finished in %.0fs: fetched=%d failed=%d empty=%d too_long=%d "
+        "fresh=%d deferred=%d",
         time.time() - scan_start,
         progress["n"],
         progress["fail"],
         progress["empty"],
+        progress["too_long"],
         progress["cached"],
         progress["deferred"],
     )
@@ -1658,14 +1819,20 @@ def load_ss_rows(conn, cfg):
     ).fetchall()
 
 
-def _ss_itineraries(cfg, ss_rows, rt_prices):
+def _ss_itineraries(cfg, ss_rows):
     """Synthesize itineraries from Skyscanner deals, merged into the ranking.
-    Only deals cheaper than the Google round-trip for the same pair are kept."""
+    Ranking is independent of Google: deals are kept even without a matching
+    Google round-trip (OTA/self-transfer fares often undercut it invisibly).
+    Rows older than indicative_after_hours stay visible but are flagged
+    'indicative'; rows older than max_age_hours are dropped."""
     out = []
     s = cfg["search"]
+    sk_cfg = cfg.get("skyscanner", {})
     max_hours = cfg.get("ranking", {}).get("max_leg_hours", 0)
-    max_age = cfg.get("skyscanner", {}).get("max_age_hours", 36)
-    bag_estimate = cfg.get("skyscanner", {}).get("checked_bag_estimate_eur", 0)
+    max_age = sk_cfg.get("max_age_hours", 168)
+    indicative_after = sk_cfg.get("indicative_after_hours", 24)
+    eligible_per_pair = sk_cfg.get("eligible_deals", 5)
+    bag_estimate = sk_cfg.get("checked_bag_estimate_eur", 0)
     start = date.fromisoformat(s["date_start"])
     end = date.fromisoformat(s["date_end"])
     for (
@@ -1696,7 +1863,6 @@ def _ss_itineraries(cfg, ss_rows, rt_prices):
         deals = json.loads(deals_json)
         if not deals:
             continue
-        g = rt_prices.get((origin, dest, d1, d2))
         accepted_keys = set()
         valid_destinations = {dest, *CITIES.get(dest, set())}
         for deal in deals:
@@ -1704,8 +1870,6 @@ def _ss_itineraries(cfg, ss_rows, rt_prices):
             legs = deal.get("legs") or []
             if (
                 eur is None
-                or g is None
-                or eur + bag_estimate >= g
                 or len(legs) != 2
                 or legs[0].get("from") != origin
                 or legs[0].get("to") not in valid_destinations
@@ -1792,11 +1956,13 @@ def _ss_itineraries(cfg, ss_rows, rt_prices):
                     "self_transfer": bool(deal.get("self_transfer")),
                     "protected": bool(deal.get("protected")),
                     "bag_included": False,
+                    "indicative": age > indicative_after,
+                    "ss_age_hours": round(age, 1),
                     "fetched_at": fetched_at,
                 }
             )
             accepted_keys.add(itinerary_key)
-            if len(accepted_keys) == 2:
+            if len(accepted_keys) == eligible_per_pair:
                 break
     for it in out:
         it["total"] = it["airfare"] + it["transfers"]
@@ -1899,12 +2065,7 @@ def build_itineraries(cfg, rows, ss_rows=None):
     for it in itins:
         it["total"] = it["airfare"] + it["transfers"]
     if ss_rows:
-        rt_prices = {}
-        for it in itins:
-            if it["kind"] == "RT":
-                key = (it["out_origin"], it["in_city"], it["d1"], it["d2"])
-                rt_prices.setdefault(key, it["airfare"])
-        itins.extend(_ss_itineraries(cfg, ss_rows, rt_prices))
+        itins.extend(_ss_itineraries(cfg, ss_rows))
     keys = [it["key"] for it in itins]
     if len(keys) != len(set(keys)):
         raise RuntimeError("duplicate itinerary keys generated")
@@ -1957,6 +2118,7 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
 
     best_rt = next((i for i in itins if i["kind"] == "RT"), None)
     best_oj = next((i for i in itins if i["kind"] == "OJ"), None)
+    best_ss = next((i for i in itins if i["kind"] == "SS"), None)
 
     def card(label, it, best=False):
         cls = "card best" if best else "card"
@@ -2068,23 +2230,42 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
         tr_items = "; ".join(f"{n} ({v:.0f})" for n, v in it["transfer_items"])
         idx = i - 1
         badge_cls = "badge" if it["kind"] in ("RT", "SS") else "badge oj"
-        agent_html = (
-            f'<br><small class="muted">via {html.escape(it.get("agent", ""))}'
-            f"{' · self-transfer' if it.get('self_transfer') else ''}"
-            f"{' · protected' if it.get('protected') else ''}</small>"
-            if it["kind"] == "SS"
-            else ""
-        )
+        agent_html = ""
+        if it["kind"] == "SS":
+            extras = []
+            if it.get("self_transfer"):
+                extras.append("self-transfer")
+            if it.get("protected"):
+                extras.append("protected")
+            if it.get("indicative"):
+                extras.append(
+                    f"<b>indicative</b>, checked {it.get('ss_age_hours', 0):.0f}h ago"
+                )
+            suffix = (" · " + " · ".join(extras)) if extras else ""
+            agent_html = (
+                f'<br><small class="muted">via {html.escape(it.get("agent", ""))}'
+                f"{suffix}</small>"
+            )
+        if it["kind"] == "SS":
+            airfare_cell = (
+                f'<td class="num" data-sort-number="{it["airfare"]:.2f}">'
+                f'<span data-eur="{it["airfare"]:.0f}">{it["airfare"]:.0f}</span><br>'
+                f'<small title="raw OTA fare plus a conservative checked-bag estimate per person">'
+                f'<span data-eur="{it.get("ota_base_fare") or 0:.0f}">{it.get("ota_base_fare") or 0:.0f}</span>'
+                f' fare + <span data-eur="{it.get("bag_estimate") or 0:.0f}">{it.get("bag_estimate") or 0:.0f}</span> bags</small></td>'
+            )
+        else:
+            airfare_cell = f'<td class="num" data-eur="{it["airfare"]:.0f}" data-sort-number="{it["airfare"]:.2f}">{it["airfare"]:.0f}</td>'
         rows_html.append(
             f'<tr data-eur-total="{it["total"]:.2f}" data-origin="{html.escape(it["out_origin"])}" '
-            f'data-days="{trip_days}" data-i="{idx}" title="click for details">'
+            f'data-days="{trip_days}" data-kind="{it["kind"]}" data-i="{idx}" title="click for details">'
             f'<td class="rank">{i}</td><td><span class="{badge_cls}">{kind_label}</span>{agent_html}</td><td>{route_txt}</td>'
             f'<td data-sort="{it["d1"]}">{fmt_date(it["d1"])}</td>'
             f'<td data-sort="{it["d2"]}">{fmt_date(it["d2"])}</td>'
             f'<td class="num" data-sort-number="{trip_days}">{trip_days}</td>'
             f"{leg_cell(o)}"
             f"{leg_cell(r, unavailable=it.get('ret_unavailable', False))}"
-            f'<td class="num" data-eur="{it["airfare"]:.0f}" data-sort-number="{it["airfare"]:.2f}">{it["airfare"]:.0f}</td>'
+            f"{airfare_cell}"
             f'<td class="num" data-eur="{it["transfers"]:.0f}" data-sort-number="{it["transfers"]:.2f}" title="{html.escape(tr_items)}">{it["transfers"]:.0f}</td>'
             f'<td class="num total" data-eur="{it["total"]:.0f}" data-sort-number="{it["total"]:.2f}">{it["total"]:.0f}</td>'
             f'<td class="num">{delta}</td><td>{links}</td></tr>'
@@ -2107,6 +2288,8 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
                 "ret_unavailable": it.get("ret_unavailable", False),
                 "self_transfer": it.get("self_transfer", False),
                 "protected": it.get("protected", False),
+                "indicative": it.get("indicative", False),
+                "ss_age_hours": it.get("ss_age_hours"),
                 "bag_included": it.get("bag_included", True),
                 "ota_base_fare": it.get("ota_base_fare"),
                 "bag_estimate": it.get("bag_estimate"),
@@ -2243,7 +2426,10 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
         (
             f"{progress['n']}",
             "fetched this run",
-            f"{progress.get('empty', 0)} flexible-only, {progress['fail']} failed",
+            (
+                f"{progress.get('empty', 0)} flexible-only, "
+                f"{progress.get('too_long', 0)} over max leg, {progress['fail']} failed"
+            ),
         ),
         (
             f"{progress.get('deferred', 0)}",
@@ -2251,6 +2437,33 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
             None,
         ),
     ]
+    ss_prefix = f"v{CACHE_VERSION}_{cfg['search'].get('adults', 2)}|%"
+    ss_checked, ss_oldest = conn.execute(
+        "SELECT COUNT(*), MIN(last_success_at) FROM skyscanner_attempts "
+        "WHERE key LIKE ? AND last_success_at IS NOT NULL",
+        (ss_prefix,),
+    ).fetchone()
+    ss_total = len(_ss_universe(cfg))
+    ss_stored = conn.execute(
+        "SELECT COUNT(*) FROM skyscanner_prices WHERE key LIKE ?", (ss_prefix,)
+    ).fetchone()[0]
+    if ss_total:
+        sk_cfg = cfg.get("skyscanner", {})
+        n_explore = max(1, sk_cfg.get("explore_combos", 25))
+        remaining = max(0, ss_total - ss_checked)
+        runs_needed = (remaining + n_explore - 1) // n_explore
+        sweep_days = runs_needed * sk_cfg.get("min_age_hours", 3) / 24
+        oldest_txt = f"{_stats_age(ss_oldest):.0f}h" if ss_oldest else "–"
+        stat_items.append(
+            (
+                f"{ss_checked}/{ss_total}",
+                "Skyscanner pairs checked",
+                (
+                    f"{ss_stored} stored with deals · oldest {oldest_txt}"
+                    f" · full sweep ≈ {sweep_days:.0f}d"
+                ),
+            )
+        )
     stats_html = ""
     for value, label, sub in stat_items:
         sub_html = f"<small>{html.escape(sub)}</small>" if sub else ""
@@ -2278,7 +2491,8 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
         "__CARDS__",
         card("Cheapest overall", itins[0] if itins else None, best=True)
         + card("Cheapest round trip", best_rt)
-        + card("Cheapest open jaw", best_oj),
+        + card("Cheapest open jaw", best_oj)
+        + card("Cheapest OTA (Skyscanner)", best_ss),
     )
     html_doc = html_doc.replace("__STATS__", stats_html)
     html_doc = html_doc.replace("__ROWS__", "\n".join(rows_html))
@@ -2453,10 +2667,17 @@ TEMPLATE = """<!doctype html>
    <button id="btn-eur" class="active" onclick="setCur('EUR')">EUR</button>
    <button id="btn-huf" onclick="setCur('HUF')">HUF</button>
   </div>
-  <div class="filters" aria-label="Table filters">
-   <label class="filter">Departure city
-    <select id="filter-origin">__ORIGIN_OPTIONS__</select>
-   </label>
+   <div class="filters" aria-label="Table filters">
+    <label class="filter">Departure city
+     <select id="filter-origin">__ORIGIN_OPTIONS__</select>
+    </label>
+    <label class="filter">Source
+     <select id="filter-source">
+      <option value="">All sources</option>
+      <option value="google">Google (RT / open jaw)</option>
+      <option value="ota">OTA (Skyscanner)</option>
+     </select>
+    </label>
    <label class="filter">Trip days
     <span class="day-range">
      <input id="filter-days-min" type="number" min="__MIN_DAYS__" max="__MAX_DAYS__" value="__MIN_DAYS__" aria-label="Minimum trip days">
@@ -2483,9 +2704,11 @@ __ROWS__
 </tbody>
  </table>
  </div>
- <p class="foot">Prices per person from __ADULTS__-adult queries, max __MAX_STOPS__ stops.
- Google fares request one checked bag; Skyscanner/OTA base fares add a conservative
- configured checked-bag estimate and are labelled separately.
+<p class="foot">Prices per person from __ADULTS__-adult queries, max __MAX_STOPS__ stops.
+  Google fares request one checked bag. Skyscanner/OTA fares are ranked independently of
+  Google: the airfare column shows the raw OTA fare plus a conservative configured
+  checked-bag estimate (hover for the breakdown). Rows marked <i>indicative</i> were
+  last checked more than a day ago — re-verify via the Skyscanner link before booking.
  Open jaw = sum of two one-ways (verify the true multi-city price via the GF links).
  Times are local; (+n) = arrival n days after departure; duration includes layovers.
  For round trips the return leg is the actual flight paired with the shown outbound when
@@ -2531,13 +2754,19 @@ let sortKey = 10, sortAsc = true;
 const TABLE_LIMIT = __TABLE_LIMIT__;
 function applyFilters() {
   const origin = document.getElementById('filter-origin').value;
+  const source = document.getElementById('filter-source').value;
   const rawMin = Number(document.getElementById('filter-days-min').value);
   const rawMax = Number(document.getElementById('filter-days-max').value);
   const minDays = Math.min(rawMin, rawMax), maxDays = Math.max(rawMin, rawMax);
   const rows = [...document.querySelectorAll('#tbl tbody tr')];
   let matching = 0, visible = 0;
   rows.forEach(row => {
-    const match = (!origin || row.dataset.origin === origin) &&
+    const kind = row.dataset.kind || 'RT';
+    const sourceMatch = !source ||
+      (source === 'ota' && kind === 'SS') ||
+      (source === 'google' && (kind === 'RT' || kind === 'OJ'));
+    const match = sourceMatch &&
+      (!origin || row.dataset.origin === origin) &&
       Number(row.dataset.days) >= minDays && Number(row.dataset.days) <= maxDays;
     if (match) matching++;
     const show = match && visible < TABLE_LIMIT;
@@ -2581,6 +2810,7 @@ function sortBy(th) {
 }
 function setCur(c) { cur = c; apply(); }
 document.getElementById('filter-origin').addEventListener('change', applyFilters);
+document.getElementById('filter-source').addEventListener('change', applyFilters);
 document.getElementById('filter-days-min').addEventListener('input', applyFilters);
 document.getElementById('filter-days-max').addEventListener('input', applyFilters);
 const ITINS = __ITINS__;
@@ -2646,6 +2876,8 @@ function showDetails(it) {
     ? `<div class="dlg-leg"><b>OTA caveat:</b> the checked-bag amount is an estimate, not a verified quote.` +
       `${it.self_transfer ? ' This is a self-transfer itinerary.' : ''}` +
       `${it.protected ? ' The provider marks the transfer as protected.' : ''}` +
+      `${it.indicative ? ' <b>Indicative:</b> this pair was last checked ' +
+        Math.round(it.ss_age_hours || 0) + 'h ago &mdash; re-verify via the Skyscanner link before booking.' : ''}` +
       `${it.fetched_at ? ' Fetched ' + esc(it.fetched_at.replace('T', ' ').replace('Z', ' UTC')) + '.' : ''}</div>`
     : '';
   document.getElementById('dlg-body').innerHTML = `
@@ -2780,7 +3012,7 @@ def main():
     for it in itins[:10]:
         log.info("  %7.0f EUR  %s", it["total"], it["label"])
     log.info(
-        "done in %.0fs | HTML written to %s (%.0f KB) | fetched=%d cached=%d failed=%d empty=%d",
+        "done in %.0fs | HTML written to %s (%.0f KB) | fetched=%d cached=%d failed=%d empty=%d too_long=%d",
         time.time() - started,
         args.out,
         len(html_doc) / 1024,
@@ -2788,6 +3020,7 @@ def main():
         progress["cached"],
         progress["fail"],
         progress.get("empty", 0),
+        progress.get("too_long", 0),
     )
 
 

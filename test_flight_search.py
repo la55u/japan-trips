@@ -96,6 +96,12 @@ class RankingTests(unittest.TestCase):
         self.assertEqual(price, 500)
         self.assertEqual(selected["party_price"], 1000)
 
+    def test_all_options_over_max_leg_hours_raise_too_long(self):
+        cfg = config()
+        itins = [detail("BUD -> HND", 35)]
+        with self.assertRaises(fs.TooLongError):
+            fs.summarize(itins, cfg)
+
 
 class FailureTests(unittest.TestCase):
     @patch("flight_search.time.sleep")
@@ -288,12 +294,12 @@ class SkyscannerTests(unittest.TestCase):
             2,
             "HUF",
         )
-        first = fs._ss_itineraries(cfg, [row], {row[:4]: 500})
+        first = fs._ss_itineraries(cfg, [row])
         changed = deepcopy(deal)
         changed["eur"] = 350.0
         changed["price_fmt"] = "280 000 Ft"
         second_row = (*row[:5], json.dumps([changed]), *row[6:])
-        second = fs._ss_itineraries(cfg, [second_row], {row[:4]: 500})
+        second = fs._ss_itineraries(cfg, [second_row])
 
         self.assertEqual(first[0]["key"], second[0]["key"])
         self.assertFalse(first[0]["bag_included"])
@@ -321,9 +327,9 @@ class SkyscannerTests(unittest.TestCase):
             2,
             "HUF",
         )
-        self.assertEqual(fs._ss_itineraries(cfg, [row], {row[:4]: 500}), [])
+        self.assertEqual(fs._ss_itineraries(cfg, [row]), [])
 
-    def test_filters_before_taking_two_eligible_deals(self):
+    def test_invalid_deals_are_skipped_before_accepting_eligible_ones(self):
         cfg = config()
         fetched = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         invalid = {
@@ -360,10 +366,197 @@ class SkyscannerTests(unittest.TestCase):
             "HUF",
         )
 
-        result = fs._ss_itineraries(cfg, [row], {row[:4]: 500})
+        result = fs._ss_itineraries(cfg, [row])
 
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["agent"], "Valid")
+
+    def test_deal_without_google_match_is_still_ranked(self):
+        cfg = config()
+        fetched = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        deal = {
+            "eur": 300,
+            "agents": ["Agent"],
+            "legs": [
+                {
+                    "from": "BUD",
+                    "to": "HND",
+                    "stops": 1,
+                    "dep": "2027-03-22T10:00",
+                    "arr": "2027-03-23T10:00",
+                },
+                {
+                    "from": "HND",
+                    "to": "BUD",
+                    "stops": 1,
+                    "dep": "2027-04-03T10:00",
+                    "arr": "2027-04-03T20:00",
+                },
+            ],
+        }
+        row = (
+            "BUD",
+            "TYO",
+            "2027-03-22",
+            "2027-04-03",
+            1,
+            json.dumps([deal]),
+            fetched,
+            2,
+            "HUF",
+        )
+
+        result = fs._ss_itineraries(cfg, [row])
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["ota_base_fare"], 300)
+        self.assertEqual(result[0]["bag_estimate"], 0)
+
+    def test_up_to_five_unique_deals_per_pair_are_accepted(self):
+        cfg = config()
+        cfg["skyscanner"]["checked_bag_estimate_eur"] = 0
+        fetched = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        deals = []
+        for i in range(6):
+            deals.append(
+                {
+                    "eur": 300 + i,
+                    "agents": [f"Agent{i}"],
+                    "legs": [
+                        {
+                            "from": "BUD",
+                            "to": "HND",
+                            "stops": 1,
+                            "dep": "2027-03-22T10:00",
+                            "arr": "2027-03-23T10:00",
+                        },
+                        {
+                            "from": "HND",
+                            "to": "BUD",
+                            "stops": 1,
+                            "dep": "2027-04-03T10:00",
+                            "arr": "2027-04-03T20:00",
+                        },
+                    ],
+                }
+            )
+        row = (
+            "BUD",
+            "TYO",
+            "2027-03-22",
+            "2027-04-03",
+            6,
+            json.dumps(deals),
+            fetched,
+            2,
+            "HUF",
+        )
+
+        result = fs._ss_itineraries(cfg, [row])
+
+        self.assertEqual(len(result), 5)
+
+    def test_stale_rows_become_indicative_then_expire(self):
+        cfg = config()
+        cfg["skyscanner"]["max_age_hours"] = 168
+        cfg["skyscanner"]["indicative_after_hours"] = 24
+        deal = {
+            "eur": 300,
+            "agents": ["Agent"],
+            "legs": [
+                {
+                    "from": "BUD",
+                    "to": "HND",
+                    "stops": 1,
+                    "dep": "2027-03-22T10:00",
+                },
+                {
+                    "from": "HND",
+                    "to": "BUD",
+                    "stops": 1,
+                    "dep": "2027-04-03T10:00",
+                },
+            ],
+        }
+        row = (
+            "BUD",
+            "TYO",
+            "2027-03-22",
+            "2027-04-03",
+            1,
+            json.dumps([deal]),
+            "2026-09-11T00:00:00Z",  # ~60h old at test run time
+            2,
+            "HUF",
+        )
+        result = fs._ss_itineraries(cfg, [row])
+        self.assertEqual(len(result), 1)
+        self.assertTrue(result[0]["indicative"])
+
+        expired = (*row[:6], "2026-05-01T00:00:00Z", *row[7:])
+        self.assertEqual(fs._ss_itineraries(cfg, [expired]), [])
+
+    def test_deal_cheaper_than_google_is_not_required_anymore(self):
+        cfg = config()
+        cfg["skyscanner"]["checked_bag_estimate_eur"] = 0
+        fetched = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        deal = {
+            "eur": 600,
+            "agents": ["Agent"],
+            "legs": [
+                {
+                    "from": "BUD",
+                    "to": "HND",
+                    "stops": 1,
+                    "dep": "2027-03-22T10:00",
+                },
+                {
+                    "from": "HND",
+                    "to": "BUD",
+                    "stops": 1,
+                    "dep": "2027-04-03T10:00",
+                },
+            ],
+        }
+        row = (
+            "BUD",
+            "TYO",
+            "2027-03-22",
+            "2027-04-03",
+            1,
+            json.dumps([deal]),
+            fetched,
+            2,
+            "HUF",
+        )
+
+        # Google RT at 500 — the deal is more expensive but still ranked
+        result = fs._ss_itineraries(cfg, [row])
+
+        self.assertEqual(len(result), 1)
+
+    def test_universe_matches_rt_plan(self):
+        cfg = config()
+        universe = set(fs._ss_universe(cfg))
+        rt_plan = {spec[1:] for spec in fs.plan_queries(cfg) if spec[0] == "RT"}
+        self.assertEqual(universe, rt_plan)
+
+    def test_exploration_is_oldest_first_and_balanced(self):
+        due = [
+            ((0, "", c), c)
+            for c in [
+                ("BUD", "TYO", "2027-03-22", "2027-04-03"),
+                ("BUD", "OSA", "2027-03-22", "2027-04-03"),
+                ("VIE", "TYO", "2027-03-22", "2027-04-03"),
+                ("VIE", "OSA", "2027-03-22", "2027-04-05"),
+                ("VIE", "OSA", "2027-03-23", "2027-04-06"),
+            ]
+        ]
+        picked = fs._select_exploration(due, 3)
+        self.assertEqual(len(picked), 3)
+        # round-robin across (route, duration) cells, oldest within each
+        routes = {(c[0], c[1]) for c in picked}
+        self.assertLessEqual(len(routes), 3)
 
     def test_wrong_route_or_date_is_excluded(self):
         cfg = config()
@@ -398,7 +591,7 @@ class SkyscannerTests(unittest.TestCase):
             "HUF",
         )
 
-        self.assertEqual(fs._ss_itineraries(cfg, [row], {row[:4]: 500}), [])
+        self.assertEqual(fs._ss_itineraries(cfg, [row]), [])
 
     def test_duplicate_deals_do_not_hide_next_unique_deal(self):
         cfg = config()
@@ -437,9 +630,168 @@ class SkyscannerTests(unittest.TestCase):
             "HUF",
         )
 
-        result = fs._ss_itineraries(cfg, [row], {row[:4]: 500})
+        result = fs._ss_itineraries(cfg, [row])
 
         self.assertEqual(len(result), 2)
+
+
+class SchedulerTests(unittest.TestCase):
+    def _cfg(self):
+        cfg = config()
+        cfg["skyscanner"] = {
+            "enabled": True,
+            "min_age_hours": 3,
+            "hot_combos": 1,
+            "neighbour_combos": 0,
+            "explore_combos": 3,
+            "hot_refresh_hours": 18,
+            "explore_refresh_hours": 120,
+            "top_deals": 10,
+            "eligible_deals": 5,
+            "max_age_hours": 168,
+            "indicative_after_hours": 24,
+            "currency": "HUF",
+            "checked_bag_estimate_eur": 120,
+            "domain": "skyscanner.hu",
+        }
+        return cfg
+
+    @staticmethod
+    def _raw_deal(price_raw=60000):
+        return {
+            "price_raw": price_raw,
+            "price_fmt": f"{price_raw} Ft",
+            "currency": "HUF",
+            "agents": ["Agent"],
+            "legs": [
+                {
+                    "from": "BUD",
+                    "to": "HND",
+                    "stops": 1,
+                    "dep": "2027-03-22T10:00",
+                    "arr": "2027-03-23T10:00",
+                    "dur_min": 1200,
+                    "carriers": ["Airline"],
+                },
+                {
+                    "from": "HND",
+                    "to": "BUD",
+                    "stops": 1,
+                    "dep": "2027-04-03T10:00",
+                    "arr": "2027-04-03T20:00",
+                    "dur_min": 1200,
+                    "carriers": ["Airline"],
+                },
+            ],
+        }
+
+    @patch("flight_search._travelpayouts_cheap_pairs", return_value={})
+    @patch("flight_search.skyscanner_spotcheck")
+    def test_tiered_selection_and_persistence(self, spotcheck, _tp):
+        cfg = self._cfg()
+        conn = fs.init_db(":memory:")
+        self.addCleanup(conn.close)
+        winner = ("BUD", "TYO", "2027-03-22", "2027-04-03")
+        conn.execute(
+            """INSERT INTO skyscanner_prices
+               (key, origin, dest, d1, d2, total_results, deals_json,
+                fetched_at, adults, currency)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "v2_2|" + "|".join(winner),
+                *winner,
+                1,
+                json.dumps([{"eur": 300.0, "agents": ["Agent"]}]),
+                "2026-09-11T00:00:00Z",  # older than hot_refresh_hours
+                2,
+                "HUF",
+            ),
+        )
+        spotcheck.return_value = [
+            (winner[0], winner[1], winner[2], winner[3], 5, [self._raw_deal()])
+        ]
+        args = SimpleNamespace(rank_only=False, no_skyscanner=False)
+
+        fs.run_skyscanner_if_due(cfg, conn, args, [])
+
+        combos = {
+            tuple(r[0].split("|")[1:])
+            for r in conn.execute("SELECT key FROM skyscanner_attempts")
+        }
+        # hot tier refreshed the stored winner; exploration filled the rest
+        self.assertIn(winner, combos)
+        self.assertEqual(len(combos), 4)
+        self.assertEqual(spotcheck.call_count, 1)
+        selected = spotcheck.call_args[0][2]
+        self.assertIn(winner, selected)
+        self.assertEqual(len(selected), 4)
+        # results persisted
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) FROM skyscanner_prices WHERE key LIKE 'v2_2|%'"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertIsNotNone(
+            conn.execute(
+                "SELECT value FROM state WHERE key='skyscanner_last_run_v2_2'"
+            ).fetchone()
+        )
+
+    @patch("flight_search._travelpayouts_cheap_pairs", return_value={})
+    @patch("flight_search.skyscanner_spotcheck")
+    def test_recent_run_blocks_rescan(self, spotcheck, _tp):
+        cfg = self._cfg()
+        conn = fs.init_db(":memory:")
+        self.addCleanup(conn.close)
+        conn.execute(
+            "INSERT INTO state (key, value) VALUES ('skyscanner_last_run_v2_2', ?)",
+            (datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),),
+        )
+        args = SimpleNamespace(rank_only=False, no_skyscanner=False)
+
+        fs.run_skyscanner_if_due(cfg, conn, args, [])
+
+        spotcheck.assert_not_called()
+
+
+class TooLongTests(unittest.TestCase):
+    def _long_itin(self):
+        it = detail("BUD -> HND", 35)
+        it["price"] = 1400
+        it["legs"] = [{"from": "BUD", "to": "HND", "date": "2027-03-22"}]
+        return it
+
+    @patch("flight_search.fetch_with_retry")
+    def test_too_long_result_is_recorded_as_confirmed(self, fetch):
+        cfg = config()
+        cfg["search"]["origins"] = ["BUD"]
+        cfg["search"]["destinations"] = ["TYO"]
+        fetch.return_value = ([self._long_itin()], None, [], object(), "page")
+        conn = fs.init_db(":memory:")
+        self.addCleanup(conn.close)
+        args = SimpleNamespace(workers=1, step=0, rank_only=False, force=False, limit=1)
+
+        progress = fs.run_scan(cfg, conn, args, "2026-09-13T00:00:00Z")
+
+        row = conn.execute(
+            "SELECT price, fetched_at, detail FROM price_cache"
+        ).fetchone()
+        self.assertEqual(progress["fail"], 0)
+        self.assertEqual(progress["too_long"], 1)
+        self.assertIsNone(row[0])
+        self.assertIsNotNone(row[1])
+        self.assertIn("too_long", row[2])
+
+        # confirmed rows are only TTL-refreshed, not retried every run:
+        # the second run only fetches never-seen OW queries; the RT row stays
+        fetch.reset_mock()
+        fs.run_scan(cfg, conn, args, "2026-09-13T01:00:00Z")
+        rt_fetched, rt_detail = conn.execute(
+            "SELECT fetched_at, detail FROM price_cache WHERE key LIKE '%|RT|%'"
+        ).fetchone()
+        self.assertEqual(rt_fetched, row[1])
+        self.assertIn("too_long", rt_detail)
 
 
 class ParserTests(unittest.TestCase):
@@ -482,6 +834,76 @@ class RenderTests(unittest.TestCase):
         self.assertIn('data-origin="BUD" data-days="12"', rendered)
         self.assertIn('data-origin="VIE" data-days="12"', rendered)
         self.assertIn("const TABLE_LIMIT = 1;", rendered)
+
+    def test_ss_rows_render_source_kind_indicative_and_fare_breakdown(self):
+        cfg = config()
+        cfg["skyscanner"] = {
+            "enabled": True,
+            "max_age_hours": 168,
+            "indicative_after_hours": 24,
+            "eligible_deals": 5,
+            "checked_bag_estimate_eur": 30,
+            "currency": "HUF",
+        }
+        fetched = "2026-09-11T00:00:00Z"  # ~60h old -> indicative
+        deal = {
+            "eur": 300,
+            "agents": ["Agent"],
+            "self_transfer": True,
+            "legs": [
+                {
+                    "from": "BUD",
+                    "to": "HND",
+                    "stops": 1,
+                    "dep": "2027-03-22T10:00",
+                    "arr": "2027-03-23T10:00",
+                    "dur_min": 1200,
+                },
+                {
+                    "from": "HND",
+                    "to": "BUD",
+                    "stops": 1,
+                    "dep": "2027-04-03T10:00",
+                    "arr": "2027-04-03T20:00",
+                    "dur_min": 1200,
+                },
+            ],
+        }
+        row = (
+            "BUD",
+            "TYO",
+            "2027-03-22",
+            "2027-04-03",
+            1,
+            json.dumps([deal]),
+            fetched,
+            2,
+            "HUF",
+        )
+        itins = fs.build_itineraries(cfg, {}, ss_rows=[row])
+        fs.label_itins(itins)
+        conn = fs.init_db(":memory:")
+        self.addCleanup(conn.close)
+        args = SimpleNamespace(top=40)
+        progress = {"n": 0, "fail": 0, "empty": 0, "deferred": 0}
+
+        rendered = fs.render_html(
+            cfg, itins, {}, None, "2026-09-13T00:00:00Z", conn, args, progress
+        )
+
+        self.assertIn('data-kind="SS"', rendered)
+        self.assertRegex(rendered, r"indicative</b>, checked \d+h ago")
+        self.assertIn('value="ota">OTA (Skyscanner)', rendered)
+        self.assertIn("Cheapest OTA (Skyscanner)", rendered)
+        # airfare cell keeps the bag-normalized total plus the raw breakdown
+        self.assertIn(
+            '<span data-eur="300">300</span> fare + <span data-eur="30">30</span> bags',
+            rendered,
+        )
+        self.assertEqual(
+            [it["kind"] for it in itins],
+            ["SS"],
+        )
 
 
 class DatabaseTests(unittest.TestCase):

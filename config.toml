@@ -23,21 +23,42 @@ eur_per_gbp = 1.17
 
 [skyscanner]
 enabled = true
-# spot-check cadence: min hours between Skyscanner runs
-min_age_hours = 12
-# how many top route/date combos to check per run (3 google-top + rest gap-discovery)
-combos = 10
-# deals to keep per combo
+# Browser sessions are spaced at least this many hours apart; which combos
+# get checked is decided per-combination from skyscanner_attempts refresh
+# times, not by this global cadence.
+min_age_hours = 3
+# Tiers per run: hot = refresh stored winners; neighbour = +/-1..3-day shifts
+# around stored deals that beat Google by >100 EUR; exploration = unseen
+# pairs first, then oldest successful check, balanced across routes and trip
+# durations (Travelpayouts calendar pairs, when configured, jump the queue).
+hot_combos = 15
+neighbour_combos = 10
+explore_combos = 25
+# Hot winners are refreshed once older than this (hours)...
+hot_refresh_hours = 18
+# ...exploration pairs once older than this (hours; 5 days).
+explore_refresh_hours = 120
+# Deals accepted into the ranking per checked pair.
+eligible_deals = 5
+# Deals to keep per combo from the Skyscanner response.
 top_deals = 10
-# re-bootstrap the browser session every N fast in-page API queries
-fast_rebootstrap = 4
-# Stored OTA fares older than this are excluded from ranking and become eligible
-# for discovery again.
-max_age_hours = 36
+# Stored deals older than indicative_after_hours stay visible but are flagged
+# "indicative"; deals older than max_age_hours drop out of the ranking.
+indicative_after_hours = 24
+max_age_hours = 168
+# Re-bootstrap the browser session every N fast in-page API queries.
+fast_rebootstrap = 6
 currency = "HUF"
 # Conservative round-trip checked-bag allowance added per person before OTA
-# fares enter the merged ranking.
+# fares enter the merged ranking (raw fare also shown separately).
 checked_bag_estimate_eur = 120
+
+# Optional discovery booster: Travelpayouts Data API (cached calendar prices).
+# Used ONLY to prioritize which Skyscanner exploration pairs get checked —
+# cached prices are never shown or ranked. Free token: travelpayouts.com.
+[travelpayouts]
+enabled = false
+token = ""
 
 [cache]
 # Local runs write here (gitignored). CI scans use the repo-owned flights.db
