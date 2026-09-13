@@ -5,7 +5,9 @@
 Scan Google Flights (and Skyscanner as a secondary source) for cheap round-trip and
 open-jaw flights from Budapest (BUD) and Vienna (VIE) to Tokyo (TYO) and Osaka (OSA),
 for a 12–16 day trip between 2027-03-22 and 2027-05-31, for 2 people (prices per person,
-1-adult queries, economy, 1 checked bag, max 2 stops). Results are ranked by total
+2-adult queries divided by two, economy, 1 checked bag, max 2 stops). The 12–16 days
+means the difference between outbound and return departure dates, not nights in Japan.
+Results are ranked by total
 per-person cost (airfare + estimated in-Japan transfers + FlixBus to Vienna if used) and
 published as a static HTML page via GitHub Pages, refreshed hourly by GitHub Actions.
 
@@ -14,13 +16,14 @@ MUST be updated whenever behavior, schema, config, or pipeline changes.**
 
 ## Repository layout
 
-- `flight_search.py` — the entire pipeline in one file (~1900 lines). No other modules.
+- `flight_search.py` — the entire pipeline in one file.
+- `test_flight_search.py` — stdlib unittest regression suite.
 - `config.toml` — all knobs (window, costs, TTL, cadence, skyscanner settings).
 - `flights.db` — CI-owned SQLite (committed). Local runs use `flights_local.db`.
 - `results.html` — generated report, deployed to GitHub Pages (CI-owned).
 - `index.html` — redirect to results.html.
 - `.github/workflows/scan.yml` — hourly scan job.
-- `requirements.txt` — pinned deps.
+- `requirements.txt` — pinned runtime and Ruff dependencies.
 - `README.md` — human-facing docs.
 
 ## Environment
@@ -49,7 +52,8 @@ Query building uses `fast_flights.create_query` (protobuf builder only — its p
 NOT used; it crashes on fare-less itineraries). All HTTP via `primp` Client
 (`impersonate="chrome_145"`) + hardcoded `SOCS` cookie to bypass the EU consent wall.
 
-Fetch flow per query (`fetch_with_retry`):
+Fetch flow per query (`fetch_with_retry`), with 30-second HTTP timeouts and a shared
+2-request/second gate covering page and RPC requests:
 1. GET `https://www.google.com/travel/flights` with the tfs params → page HTML.
 2. `parse_payload`: extract the `ds:1` script, split `data:` JSON.
    - Normal variant: `payload[3][0]` = itineraries; each entry parsed by
@@ -69,15 +73,19 @@ Fetch flow per query (`fetch_with_retry`):
      (dash count varies!).
    - `errorHasStatus: true` suffix is NOT an exception anymore — same handling as
      no-results variant (harvest suggestions).
-   - Retry: exceptions retry 3× with backoff; no-results never retries (deterministic).
+    - Retry: transport, HTTP, parser, and unrecognized-response failures retry 3× with
+      backoff. Only a structurally valid RPC response is accepted as confirmed empty.
 3. Round-trips: after outbound parse, `fetch_return_legs` replays the "Select flight"
    RPC (`inner[0]=[None,<blob of chosen outbound>]`, legs array found structurally via
    `_find_legs_index`, outbound leg[0] rebuilt with segment list at index 8 — the
    segment list goes AFTER a null slot, see `fetch_return_legs`). Response parsed the
    same way; cheapest paired return stored in detail["ret"].
 
-Data normalization: prices are TOTAL for the queried passengers; we query 1 adult →
-per-person. Currency forced EUR.
+Data normalization: Google prices are totals for 2 adults and are divided by the
+configured passenger count before storage/ranking. Currency is forced to EUR. Parsed
+routes, dates, endpoints, and stop counts are validated against the request before a
+fare is cached. The selected-return RPC price is treated as the final paired RT fare;
+the initial summary price and mismatch are retained in detail for diagnostics.
 
 ## Ranking (build_itineraries)
 
@@ -91,6 +99,11 @@ per-person. Currency forced EUR.
 - Transfers (config `[costs]`): OJ = shinkansen 90; RT = shinkansen + domestic 65;
   FlixBus 15/direction for every leg involving VIE (out_origin or ret_dest).
 - Sort by total = airfare + transfers.
+- RT rows return to their European origin; VIE RT therefore incurs two FlixBus legs.
+- Itinerary keys are asserted unique. OJ generation is independent of the RT
+  destination loop, so every OJ combination is generated once.
+- `[ranking].max_leg_hours` excludes options with a known leg over 30 hours; the
+  cheapest eligible option is selected from each Google response.
 
 ## Skyscanner pipeline (secondary source)
 
@@ -108,15 +121,25 @@ per-person. Currency forced EUR.
   data) — this is a known, accepted limitation.
 - Fetch (`skyscanner_spotcheck`): camoufox (anti-fingerprint Firefox, humanize, geoip,
   locale hu-HU) loads `skyscanner.hu` search URLs (`_ss_url`, dates as YYMMDD, city
-  codes `bud/vie` + `tyoa/osaa`). PerimeterX challenge = `#px-captcha` press-and-hold
-  solved by `_solve_px` (mouse down 11s with tremor, up, re-navigate). Data captured by
-  listening for XHR `web-unified-search` status 200 body >100KB; largest body parsed by
-  `_parse_skyscanner_payload`: `itineraries.results[]` (price.raw/formatted,
+  codes `bud/vie` + `tyoa/osaa`, 2 adults). The fast path captures the SPA's POST
+  headers, replays `web-unified-search` in-page, and polls with the top-level response
+  `context.sessionId`; it re-bootstraps every `fast_rebootstrap` queries. Any fast-path
+  failure falls back to full navigation/XHR capture. PerimeterX challenge =
+  `#px-captcha` press-and-hold solved by `_solve_px`. Responses parse
+  `itineraries.results[]` (price.raw/formatted,
   isSelfTransfer, isProtectedSelfTransfer, pricingOptions→agents + deep link,
   legs with origin/destination ids, stopCount, departure/arrival, durationInMinutes,
   carriers). Keeps top `top_deals` (10) cheapest per combo, adds `eur` conversion
-  (HUF via `huf_per_eur`, GBP via `gbp_per_eur`).
-- Storage: `skyscanner_prices` table (key origin|dest|d1|d2, deals_json, fetched_at).
+  using an explicit configured/response currency (HUF via `huf_per_eur`, GBP via
+  `eur_per_gbp`; unknown currencies are rejected). Party totals are divided by adults.
+- Storage: versioned `skyscanner_prices` keys include adults; rows carry currency and
+  passenger count. `skyscanner_attempts` tracks per-combo attempts, successes, and
+  errors. A completely failed batch remains immediately due.
+- Ranking ignores SS rows older than `max_age_hours` (36), outside current route/date/
+  duration scope, over stop/duration limits, or without a matching Google RT. Stored
+  discoveries become eligible for refresh after expiry. A configured EUR 120 checked-
+  bag estimate is added per person before comparing with Google. Self-transfer,
+  protection, source age, and the bag caveat are retained for display.
 - CI validated: works from GitHub datacenter IPs (6-10 combos, ~3 min, no challenges
   needed so far; challenges would be solved automatically).
 - Skyscanner links on the page point to the Skyscanner search page (`_ss_url`), NOT the
@@ -125,24 +148,30 @@ per-person. Currency forced EUR.
 ## DB schema (flights.db / flights_local.db)
 
 - `price_cache(key PK, kind RT|OW, origin, dest, d1, d2 NULL, price NULL, n_results,
-  detail JSON, prev_price, prev_fetched_at, fetched_at)` — one row per query. Key =
-  `kind|max_stops|checked_bags|origin|dest|d1|d2` (no window in key). detail JSON for
+  detail JSON, prev_price, prev_fetched_at, fetched_at, last_attempt_at, last_error)` —
+  one row per query. Keys are versioned and include cabin, currency, language, adults,
+  stops, bags, route, and dates. detail JSON for
   priced rows = best itinerary dict (price, airlines, route, stops, dep, arr, plus,
   dur_h, airports map, blob, legs, n_results); for empty rows:
   `{"no_exact_results": true, "suggestions": [...]}`; errors: `{"error": "..."}`.
-  TTL: rows with price are refetched when older than ttl_hours; no_exact_results rows
-  also respect TTL; other NULL rows (errors) are always refetched.
+  TTL: rows with price and confirmed-empty rows are refetched when older than ttl_hours.
+  Failed attempts retain last-good price/detail/fetched_at and only update attempt/error
+  fields. Rows older than `max_rank_age_hours` are not published.
 - `price_history(key, price, fetched_at)` — appended per successful fetch (not used by
   the page yet).
 - `itinerary_history(run_ts, itin_key, kind, label, airfare, transfers, total)` — top-N
-  snapshot per run; feeds deltas (prev run) and both charts.
+  snapshot per run; feeds deltas (prev run) and both charts. `(run_ts, itin_key)` is
+  unique; startup removes old duplicates before creating the index. Rank-only renders
+  do not create synthetic run/history points.
 - `runs(run_ts PK, fetched, cached, failed, note)`.
-- `state(key PK, value)` — `scan_cursor` (Google rotating offset), `skyscanner_last_run`,
-  `skyscanner_discover_cursor`.
-- `skyscanner_prices(key PK = origin|dest|d1|d2, origin, dest, d1, d2, total_results,
-  deals_json, fetched_at)` — deals_json = list of {price_raw, price_fmt, eur,
+- `state(key PK, value)` — versioned/adult-specific Skyscanner last-run and discovery
+  cursor values. Google scheduling is oldest-stale-first and needs no cursor.
+- `skyscanner_prices(key PK, origin, dest, d1, d2, total_results, deals_json,
+  fetched_at, adults, currency)` — deals_json = list of {price_raw, price_fmt, eur,
   self_transfer, protected, agents, legs[{from,to,stops,dep,arr,dur_min,carriers}],
   link(agent deeplink, stored not rendered)}.
+- `skyscanner_attempts(key PK, last_attempt_at, last_success_at, last_error)`.
+- `price_history`, `itinerary_history`, and `runs` use 180-day retention.
 
 ## HTML page (results.html)
 
@@ -158,6 +187,9 @@ Dialog (native `<dialog>`): full row details — airport names, times, durations
 per line, all booking links. EUR/HUF toggle (huf_per_eur), sortable headers with ▲▼
 indicator (default sort: Total asc). Stats strip: prices tracked (by kind), date pairs
 checked/planned, newest/stalest cache age, history points, runs, this-run counts.
+Client-side filters select departure city and a min/max trip-day range. Rendering keeps
+the top `top_n` rows per `(departure city, trip days)` bucket, then the browser displays
+at most `top_n` matching rows under the active filters and sort order.
 Charts (Chart.js CDN): per-itinerary totals over runs (top history_top_n), cheapest
 overall per run.
 
@@ -165,14 +197,15 @@ overall per run.
 
 Hourly at :23 (off-peak — top-of-hour crons get skipped by GitHub's scheduler; observed
 overnight blackout with `0 * * * *`). Steps: checkout@v7 → setup-python@v7 (3.14) →
-pip install -r requirements.txt → `python -m camoufox fetch` → `python flight_search.py
+pip install → Ruff + unittest → `python -m camoufox fetch` → `python flight_search.py
 --limit 450 --db flights.db --out results.html` → commit `results.html` + `flights.db`
-as github-actions[bot] with race-proof commit step (pull --rebase; on conflict reset to
-remote — lost rows are refetched next run) → push (Pages redeploys automatically).
+as github-actions[bot] with pull --rebase; conflicts fail visibly rather than silently
+discarding a completed scan → push (Pages redeploys automatically).
 Concurrency group `scan` (serial). timeout-minutes 60. Rate config: TTL 4h, 450/run
-hourly → full window (1708 queries) refreshed every ~4h; per-second rate ~2 q/s
-(unchanged — rate, not volume, is the blocking risk). Backoff: ≥5 consecutive failures
-→ pause 60s×min(n-4,5). `workflow_dispatch` for manual runs.
+hourly → full window (1708 queries) targets a ~4h refresh. Oldest stale rows are always
+selected first and the report distinguishes fresh from deferred stale work. The shared
+gate enforces ~2 HTTP requests/s across workers and real cooldowns block workers.
+`workflow_dispatch` supports manual runs.
 
 ## Google blocking model (empirical)
 
@@ -186,11 +219,13 @@ OTA self-transfer combos — that gap is Skyscanner's value-add.
 - RT return leg details: real via Select-flight RPC for newly scanned rows; older rows
   fall back to ≈ reference (best one-way same date).
 - OJ price = sum of two one-ways (slight overestimate vs true multi-city ticket).
-- SS prices are OTA fares: separate tickets/self-transfer, bag fees often extra, agent
-  middleman — shown with badge, never mixed into Google ranking semantics.
-- SS EUR conversion: HUF via huf_per_eur, GBP via gbp_per_eur (approximate, config).
+- SS prices are OTA fares: separate tickets/self-transfer and agent middlemen. They are
+  shown with an OTA badge and caveats; a conservative bag estimate improves but cannot
+  guarantee checkout-price comparability.
+- SS EUR conversion: HUF via `huf_per_eur`, GBP via `eur_per_gbp` (static config rates).
 - PerimeterX: camoufox + press-and-hold has passed consistently (local + CI). Volume
-  kept low (≤10 searches per 12h, 5–10s gaps). If PX escalates: volume down or
+  kept low (≤10 searches per 12h; fast requests use 1–2s gaps and navigation fallback
+  uses 5–10s gaps). If PX escalates: volume down or
   residential proxy (camoufox supports `proxy=`).
 - Month-grid mining ("cheapest month" survey, one request ≈ 60 date pairs) was
   investigated: the month page bounces direct entries to the homepage (needs search
@@ -208,16 +243,18 @@ OTA self-transfer combos — that gap is Skyscanner's value-add.
 - Logs: use the `log` logger (INFO default, `--verbose` debug); every line timestamped
   — CI log greps are the debugging tool (`gh run view <id> -R la55u/japan-trips --log |
   grep ...`).
-- ranking counts: RT ~1133 + OJ ~3960 + SS rows; planned Google queries: 1708.
+- Full-cache ranking counts before duration filtering: RT ~1133 + OJ ~1980 + SS rows;
+  planned Google queries: 1708.
 - The tfs protobuf request template embedded in each page is session-bound; never cache
   tokens across fetches.
 
 ## Current status / open threads
 
-- Merged single ranking table with per-row multi-source links: IMPLEMENTED locally,
-  needs CI validation (deployed page updates on next successful run).
-- Rotating Google cursor + hourly cron at :23: live.
+- Merged single ranking table with per-row multi-source links: implemented.
+- Oldest-first Google scheduling + hourly cron at :23: implemented locally; needs CI
+  validation after the two-adult cache migration.
 - Skyscanner: 10 combos/12h cadence live; gap-discovery validated (found deals up to
-  1000 EUR below Google).
+  1000 EUR below Google). Fast replay plus navigation fallback implemented locally;
+  needs CI validation.
 - Possible future work: month-grid mining (blocked on PX/flow complexity),
   residential proxy fallback, price_history-based charts, Duffel as a third source.

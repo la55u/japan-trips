@@ -2,4 +2,5 @@ fast-flights==3.1.0
 primp==2.0.0
 selectolax==0.4.11
 typing_extensions==4.16.0
-camoufox[geoip]==0.4.11
+camoufox[geoip]==0.5.6
+ruff==0.16.7

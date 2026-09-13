@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import logging
@@ -11,6 +12,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
+from itertools import pairwise
 from pathlib import Path
 
 try:
@@ -18,15 +20,58 @@ try:
 except ModuleNotFoundError:
     import tomli as tomllib
 
-from primp import Client
 from fast_flights import FlightQuery, Passengers, create_query
+from primp import Client
 
 BASE = Path(__file__).resolve().parent
 SOCS_COOKIE = "SOCS=CAESHAgBEhJnd3NfMjAyMzA4MTAtMF9SQzEaAmVuIAEaBgiA_LyaBg"
 TYO, OSA = "TYO", "OSA"
 VIE = "VIE"
+CITIES = {
+    "TYO": {"HND", "NRT"},
+    "OSA": {"KIX", "ITM", "UKB"},
+}
+CACHE_VERSION = 2
+HTTP_TIMEOUT_SECONDS = 30
 
 log = logging.getLogger("flight_search")
+
+
+class ReturnValidationError(RuntimeError):
+    pass
+
+
+class RequestGate:
+    def __init__(self, requests_per_second: float):
+        self.interval = 1 / max(requests_per_second, 0.1)
+        self.condition = threading.Condition()
+        self.next_request = 0.0
+        self.cooldown_until = 0.0
+
+    def wait(self):
+        with self.condition:
+            while True:
+                now = time.monotonic()
+                start = max(self.next_request, self.cooldown_until)
+                delay = start - now
+                if delay <= 0:
+                    self.next_request = now + self.interval
+                    return
+                self.condition.wait(timeout=delay)
+
+    def cooldown(self, seconds: float):
+        with self.condition:
+            self.cooldown_until = max(
+                self.cooldown_until, time.monotonic() + max(seconds, 0)
+            )
+            self.condition.notify_all()
+
+
+def _ensure_column(conn, table, definition):
+    name = definition.split()[0]
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if name not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
 
 
 def setup_logging(verbose: bool):
@@ -112,9 +157,25 @@ def init_db(path: str) -> sqlite3.Connection:
             key TEXT PRIMARY KEY,
             origin TEXT, dest TEXT, d1 TEXT, d2 TEXT,
             total_results INTEGER, deals_json TEXT,
-            fetched_at TEXT
+            fetched_at TEXT, adults INTEGER, currency TEXT
+        );
+        CREATE TABLE IF NOT EXISTS skyscanner_attempts (
+            key TEXT PRIMARY KEY, last_attempt_at TEXT,
+            last_success_at TEXT, last_error TEXT
         );
         """
+    )
+    _ensure_column(conn, "price_cache", "last_attempt_at TEXT")
+    _ensure_column(conn, "price_cache", "last_error TEXT")
+    _ensure_column(conn, "skyscanner_prices", "adults INTEGER")
+    _ensure_column(conn, "skyscanner_prices", "currency TEXT")
+    conn.execute(
+        "DELETE FROM itinerary_history WHERE rowid NOT IN "
+        "(SELECT MIN(rowid) FROM itinerary_history GROUP BY run_ts, itin_key)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ih_run_key "
+        "ON itinerary_history(run_ts, itin_key)"
     )
     conn.commit()
     return conn
@@ -132,18 +193,26 @@ def build_query(kind, origin, dest, d1, d2, cfg):
         max_stops=s["max_stops"],
         checked_bags=s["checked_bags"],
         flights=flights,
-        passengers=Passengers(adults=1),
+        passengers=Passengers(adults=s.get("adults", 2)),
         language="en",
     )
 
 
-def fetch_html(q):
+def fetch_html(q, gate=None):
+    if gate:
+        gate.wait()
     client = Client(impersonate="chrome_145", impersonate_os="macos", cookie_store=True)
     resp = client.get(
         "https://www.google.com/travel/flights",
         params=q.params(),
         headers={"Cookie": SOCS_COOKIE},
+        timeout=HTTP_TIMEOUT_SECONDS,
+        read_timeout=HTTP_TIMEOUT_SECONDS,
     )
+    if resp.status_code != 200:
+        if gate and resp.status_code in (403, 429):
+            gate.cooldown(60)
+        raise RuntimeError(f"Google page HTTP {resp.status_code}")
     return client, resp.text
 
 
@@ -174,12 +243,13 @@ def _itinerary_from_entry(k):
         return None
     airlines = [a if isinstance(a, str) else a[1] for a in (flight[1] or [])]
     codes = [segs[0]["from"]] + [s["to"] for s in segs]
-    dep_dt = datetime(*segs[0]["dep_d"], *segs[0]["dep_t"])
-    arr_dt = datetime(*segs[-1]["arr_d"], *segs[-1]["arr_t"])
+    dep_dt = datetime(*segs[0]["dep_d"], *segs[0]["dep_t"], tzinfo=timezone.utc)
+    arr_dt = datetime(*segs[-1]["arr_d"], *segs[-1]["arr_t"], tzinfo=timezone.utc)
     total_min = sum(s["dur_min"] for s in segs)
-    for a, b in zip(segs, segs[1:]):
+    for a, b in pairwise(segs):
         lay = (
-            datetime(*b["dep_d"], *b["dep_t"]) - datetime(*a["arr_d"], *a["arr_t"])
+            datetime(*b["dep_d"], *b["dep_t"], tzinfo=timezone.utc)
+            - datetime(*a["arr_d"], *a["arr_t"], tzinfo=timezone.utc)
         ).total_seconds() / 60
         if lay > 0:
             total_min += lay
@@ -234,7 +304,7 @@ def _rpc_extras(page_html):
     return token_m.group(0), fsid_m.group(1), bl_m.group(1), req_json
 
 
-def _rpc_post(client, fsid, bl, inner_req):
+def _rpc_post(client, fsid, bl, inner_req, gate=None):
     url = (
         f"{RPC_PATH}?f.sid={fsid}&bl={bl}"
         "&hl=en&soc-app=162&soc-platform=1&soc-device=1&_reqid=100001&rt=c"
@@ -243,19 +313,27 @@ def _rpc_post(client, fsid, bl, inner_req):
     body = "f.req=" + json.dumps(
         [None, json.dumps(inner_req, separators=(",", ":"))], separators=(",", ":")
     )
-    return client.post(
+    if gate:
+        gate.wait()
+    resp = client.post(
         url,
         headers={
             "Cookie": SOCS_COOKIE,
             "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
         },
         data=body,
+        timeout=HTTP_TIMEOUT_SECONDS,
+        read_timeout=HTTP_TIMEOUT_SECONDS,
     )
+    if gate and resp.status_code in (403, 429):
+        gate.cooldown(60)
+    return resp
 
 
-def _parse_rpc_itins(rpc_text):
+def _parse_rpc_itins(rpc_text, with_envelope=False):
     itins = []
     seen = set()
+    parsed_envelope = False
     for line in rpc_text.split("\n"):
         if not line.startswith("[["):
             continue
@@ -264,6 +342,11 @@ def _parse_rpc_itins(rpc_text):
             inner = json.loads(arr[0][2])
         except (json.JSONDecodeError, IndexError, KeyError, TypeError):
             continue
+        if not isinstance(inner, list) or len(inner) <= 3:
+            continue
+        if not any(isinstance(inner[idx], list) for idx in (2, 3)):
+            continue
+        parsed_envelope = True
         for idx in (2, 3):
             section = inner[idx] if len(inner) > idx else None
             if not isinstance(section, list):
@@ -282,22 +365,27 @@ def _parse_rpc_itins(rpc_text):
                     if key not in seen:
                         seen.add(key)
                         itins.append(it)
+    if with_envelope:
+        return itins, parsed_envelope
     return itins
 
 
-def fetch_rpc_itins(client, page_html):
+def fetch_rpc_itins(client, page_html, gate=None):
     """For the null-variant pages (ds:1 empty, suggestions instead of results),
     replay the GetShoppingResults RPC the browser would issue, using the request
     template Google embedded in the page itself."""
     extras = _rpc_extras(page_html)
     if not extras:
-        return []
+        raise RuntimeError("Google RPC metadata missing")
     token, fsid, bl, req_json = extras
     inner_req = [[None, None, None, token], req_json[1], 0, 0, 0, 1]
-    resp = _rpc_post(client, fsid, bl, inner_req)
+    resp = _rpc_post(client, fsid, bl, inner_req, gate)
     if resp.status_code != 200:
-        return []
-    return _parse_rpc_itins(resp.text)
+        raise RuntimeError(f"Google shopping RPC HTTP {resp.status_code}")
+    itins, parsed_envelope = _parse_rpc_itins(resp.text, with_envelope=True)
+    if not parsed_envelope:
+        raise RuntimeError("Google shopping RPC response was not recognized")
+    return itins
 
 
 def _find_legs_index(inner2):
@@ -318,12 +406,12 @@ def _age_hours(ts):
     return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
 
 
-def _ss_url(origin, dest, d1, d2, domain):
+def _ss_url(origin, dest, d1, d2, domain, adults=2):
     fmt = lambda d: d.replace("-", "")[2:]
     return (
         f"https://www.{domain}/transport/flights/"
         f"{origin.lower()}/{dest.lower()}a/{fmt(d1)}/{fmt(d2)}/"
-        "?adultsv2=1&cabinclass=economy&rtn=1"
+        f"?adultsv2={adults}&cabinclass=economy&rtn=1"
     )
 
 
@@ -341,7 +429,7 @@ def _solve_px(pg):
     pg.wait_for_timeout(8000)
 
 
-def _parse_skyscanner_payload(body, domain):
+def _parse_skyscanner_payload(body, domain, currency):
     data = json.loads(body)
     it = data.get("itineraries", {})
     results = it.get("results") or []
@@ -374,6 +462,7 @@ def _parse_skyscanner_payload(body, domain):
             {
                 "price_raw": r["price"]["raw"],
                 "price_fmt": r["price"].get("formatted", ""),
+                "currency": r["price"].get("currencyCode") or currency,
                 "self_transfer": bool(r.get("isSelfTransfer")),
                 "protected": bool(r.get("isProtectedSelfTransfer")),
                 "agents": [agents.get(a, a) for a in agent_ids],
@@ -386,46 +475,328 @@ def _parse_skyscanner_payload(body, domain):
     return total, deals
 
 
+# Skyscanner internal place entityIds (harvested from the site's own
+# web-unified-search requests, 2026-09). Used by the fast in-page fetch path;
+# unknown codes automatically fall back to the page-navigation flow.
+_SS_ENTITY_IDS = {
+    "BUD": "95673439",
+    "VIE": "95673444",
+    "TYO": "27542089",
+    "OSA": "27542908",
+}
+
+# Runs inside the live Skyscanner page (camoufox): POSTs the unified-search
+# query with the session's own cookies/PX state, polls until complete, and
+# extracts the top-N cheapest deals in the same shape as
+# _parse_skyscanner_payload. ~1-4s per query vs ~40-60s per page navigation.
+_SS_FETCH_JS = """
+async ([payload, headers, topN, currency]) => {
+  const post = await fetch('/g/radar/api/v2/web-unified-search/', {
+    method: 'POST', headers: headers, body: JSON.stringify(payload),
+    credentials: 'include',
+  });
+  if (post.status !== 200) return { http: post.status, err: 'post', deals: [] };
+  let data = await post.json();
+  let searchCtx = data.context || {};
+  const pollHeaders = {...headers};
+  delete pollHeaders['CONTENT-TYPE'];
+  let tries = 0;
+  while (searchCtx.status === 'incomplete' && tries < 10) {
+    await new Promise(res => setTimeout(res, 1500));
+    const poll = await fetch(
+      '/g/radar/api/v2/web-unified-search/' + encodeURIComponent(searchCtx.sessionId),
+      { method: 'GET', headers: pollHeaders, credentials: 'include' });
+    if (poll.status !== 200) return { http: poll.status, err: 'poll', deals: [] };
+    data = await poll.json();
+    searchCtx = data.context || {};
+    tries++;
+  }
+  if (searchCtx.status !== 'complete') return { http: 200, err: 'ctx:' + searchCtx.status, deals: [] };
+  const it = data.itineraries || {};
+  const itCtx = it.context || {};
+  const agents = {};
+  for (const a of (it.agents || [])) agents[a.id] = a.name || a.id;
+  const results = (it.results || []).slice();
+  results.sort((x, y) => (x.price && x.price.raw || 1e12) - (y.price && y.price.raw || 1e12));
+  const deals = [];
+  for (const r of results.slice(0, topN)) {
+    const options = r.pricingOptions || [];
+    const aids = options.length ? (options[0].agentIds || []) : [];
+    const items = options.length ? (options[0].items || []) : [];
+    const legs = (r.legs || []).map(l => ({
+      from: l.origin && l.origin.id, to: l.destination && l.destination.id,
+      stops: l.stopCount || 0, dep: l.departure, arr: l.arrival,
+      dur_min: l.durationInMinutes,
+      carriers: ((l.carriers && l.carriers.marketing) || []).map(c => c.name || ''),
+    }));
+    deals.push({
+      price_raw: r.price && r.price.raw, price_fmt: r.price && r.price.formatted,
+      currency: r.price && r.price.currencyCode || currency,
+      self_transfer: !!r.isSelfTransfer, protected: !!r.isProtectedSelfTransfer,
+      agents: aids.map(a => agents[a] || a), legs: legs,
+      link: items[0] && items[0].url ? items[0].url : null,
+    });
+  }
+  return { http: 200, err: '', total: itCtx.totalResults || results.length, deals: deals };
+}
+"""
+
+
+def _ss_fast_payload(origin, dest, d1, d2, adults=2):
+    """Build the web-unified-search POST body for an airport pair.
+    Place codes are Skyscanner 'a'-suffixed city codes (bud/tyoa) in URLs but
+    the API body uses entityIds. Returns None if an entityId is unknown."""
+    eo = _SS_ENTITY_IDS.get(origin.upper())
+    ed = _SS_ENTITY_IDS.get(dest.upper())
+    if not eo or not ed:
+        return None
+    y1, m1, dd1 = d1.split("-")
+    y2, m2, dd2 = d2.split("-")
+    return {
+        "cabinClass": "ECONOMY",
+        "childAges": [],
+        "adults": adults,
+        "legs": [
+            {
+                "legOrigin": {"@type": "entity", "entityId": eo},
+                "legDestination": {"@type": "entity", "entityId": ed},
+                "dates": {"@type": "date", "year": y1, "month": m1, "day": dd1},
+                "placeOfStay": ed,
+            },
+            {
+                "legOrigin": {"@type": "entity", "entityId": ed},
+                "legDestination": {"@type": "entity", "entityId": eo},
+                "dates": {"@type": "date", "year": y2, "month": m2, "day": dd2},
+            },
+        ],
+    }
+
+
 def skyscanner_spotcheck(cfg, conn, combos):
     """Spot-check Skyscanner (OTA / self-transfer prices) for selected
-    route/date combos via a camoufox browser. Returns rows to store."""
+    route/date combos via a camoufox browser. Returns rows to store.
+
+    Two fetch paths per combo:
+    - fast: reuse the live page session and POST the unified-search API from
+      inside the page (fetch) — ~1-4s per combo; needs known entityIds and a
+      captured bootstrap request (for headers). Re-bootstraps the page every
+      `fast_rebootstrap` fast queries; on failure falls back to navigation.
+    - slow: navigate the SPA to the combo's search URL and capture the
+      response XHR (original behavior).
+    Per-combo try/except: one failing combo never blocks the rest."""
     from camoufox.sync_api import Camoufox
 
     sk_cfg = cfg.get("skyscanner", {})
     domain = sk_cfg.get("domain", "skyscanner.hu")
+    top_deals = sk_cfg.get("top_deals", 10)
+    rebootstrap_every = max(1, sk_cfg.get("fast_rebootstrap", 4))
+    adults = cfg["search"].get("adults", 2)
+    currency = sk_cfg.get("currency", "HUF").upper()
     rows = []
     with Camoufox(
         headless=True, humanize=True, geoip=True, locale=["hu-HU"]
     ) as browser:
         pg = browser.new_page()
         captured = []
+        captured_req = []
 
         def _capture(r):
             try:
-                if "web-unified-search" in r.url and r.status == 200:
+                if "web-unified-search" not in r.url:
+                    return
+                if getattr(r, "method", "") == "POST":
+                    captured_req.append(r)
+                    return
+                if r.status == 200:
                     body = r.text()
                     if len(body) > 100000:
                         captured.append(body)
-            except Exception:
-                pass
+            except Exception as e:  # noqa: BLE001 - browser event callback boundary
+                log.debug("skyscanner response capture failed: %s", e)
 
         pg.on("response", _capture)
+        pg.on("request", _capture)
+
+        def _solve_px(url):
+            if pg.locator("#px-captcha").count():
+                cap = pg.locator("#px-captcha").first
+                cap.wait_for(timeout=10000)
+                box = cap.bounding_box()
+                x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+                pg.mouse.move(x, y)
+                pg.mouse.down()
+                for i in range(22):
+                    pg.wait_for_timeout(500)
+                    pg.mouse.move(x + (i % 3 - 1), y + (i % 2), steps=2)
+                pg.mouse.up()
+                pg.wait_for_timeout(8000)
+                pg.goto(url, timeout=90000, wait_until="domcontentloaded")
+
+        def _bootstrap(url):
+            """Load a search page, solve PX if needed, and return the SPA's own
+            web-unified-search request (for replay headers), or None."""
+            captured_req.clear()
+            pg.goto(url, timeout=90000, wait_until="domcontentloaded")
+            for _ in range(4):
+                pg.wait_for_timeout(4000)
+                if captured_req:
+                    break
+            if not captured_req:
+                _solve_px(url)
+            for _ in range(8):
+                pg.wait_for_timeout(5000)
+                if captured_req:
+                    break
+            return captured_req[-1] if captured_req else None
+
+        boot_req = _bootstrap(
+            _ss_url(*combos[0][:2], combos[0][2], combos[0][3], domain, adults)
+        )
+        skip_headers = {
+            "host",
+            "content-length",
+            "connection",
+            "alt-used",
+            "cookie",
+            "referer",
+            "accept-encoding",
+            "user-agent",
+            "origin",
+        }
+
+        def _replay_headers(req):
+            return (
+                {
+                    k.upper(): v
+                    for k, v in req.headers.items()
+                    if k.lower() not in skip_headers
+                }
+                if req
+                else {}
+            )
+
+        fast_headers = _replay_headers(boot_req)
+        fast_mode = bool(fast_headers)
+        if fast_mode:
+            log.info("skyscanner fast path armed (bootstrap request captured)")
+        since_boot = 0
+        needs_reboot = False
+
+        def _rebootstrap(combo):
+            nonlocal fast_headers, fast_mode, since_boot, needs_reboot
+            needs_reboot = False
+            fast_mode = False
+            try:
+                boot_req = _bootstrap(
+                    _ss_url(*combo[:2], combo[2], combo[3], domain, adults)
+                )
+                fast_headers = _replay_headers(boot_req)
+                fast_mode = bool(fast_headers)
+            except Exception as e:  # noqa: BLE001 - source remains best effort
+                log.warning("skyscanner re-bootstrap failed: %s", str(e)[:120])
+            since_boot = 0
+
+        def _parse_fast(out):
+            deals = []
+            for d in out.get("deals", []):
+                deals.append(
+                    {
+                        "price_raw": d["price_raw"],
+                        "price_fmt": d.get("price_fmt", ""),
+                        "currency": (d.get("currency") or currency).upper(),
+                        "self_transfer": bool(d.get("self_transfer")),
+                        "protected": bool(d.get("protected")),
+                        "agents": d.get("agents", []),
+                        "legs": [
+                            {
+                                "from": l.get("from"),
+                                "to": l.get("to"),
+                                "stops": l.get("stops", 0),
+                                "dep": (l.get("dep") or "")[:16],
+                                "arr": (l.get("arr") or "")[:16],
+                                "dur_min": l.get("dur_min"),
+                                "carriers": l.get("carriers", []),
+                            }
+                            for l in (d.get("legs") or [])
+                        ],
+                        "link": ("https://www." + domain + d["link"])
+                        if d.get("link")
+                        else None,
+                    }
+                )
+            deals.sort(key=lambda d: d["price_raw"])
+            return out.get("total", len(deals)), deals
+
         for origin, dest, d1, d2 in combos:
-            url = _ss_url(origin, dest, d1, d2, domain)
+            if needs_reboot:
+                _rebootstrap((origin, dest, d1, d2))
+            done = False
+            # --- fast path: in-page API fetch ---
+            if fast_mode:
+                payload = _ss_fast_payload(origin, dest, d1, d2, adults)
+                if payload:
+                    try:
+                        out = pg.evaluate(
+                            _SS_FETCH_JS, [payload, fast_headers, top_deals, currency]
+                        )
+                        if out.get("http") == 200 and out.get("deals"):
+                            total, deals = _parse_fast(out)
+                            rows.append((origin, dest, d1, d2, total, deals))
+                            log.info(
+                                "skyscanner(fast) %s->%s %s..%s: %d results, top %s",
+                                origin,
+                                dest,
+                                d1,
+                                d2,
+                                total,
+                                f"{deals[0]['price_fmt']} ({deals[0]['agents'][0] if deals[0]['agents'] else '?'})"
+                                if deals
+                                else "none",
+                            )
+                            done = True
+                        else:
+                            log.info(
+                                "skyscanner(fast) %s->%s %s..%s: http=%s err=%s",
+                                origin,
+                                dest,
+                                d1,
+                                d2,
+                                out.get("http"),
+                                str(out.get("err"))[:40],
+                            )
+                    except Exception as e:  # noqa: BLE001 - fall back to navigation
+                        log.warning(
+                            "skyscanner(fast) %s->%s failed: %s",
+                            origin,
+                            dest,
+                            str(e)[:120],
+                        )
+                    since_boot += 1
+                    if done and since_boot >= rebootstrap_every:
+                        _rebootstrap((origin, dest, d1, d2))
+            if done:
+                time.sleep(random.uniform(1, 2))
+                continue
+            # a fast attempt was made and failed: schedule a re-bootstrap so
+            # the next combo starts from a fresh session
+            if fast_mode and payload:
+                needs_reboot = True
+            # --- slow path: navigate the SPA (original behavior) ---
+            url = _ss_url(origin, dest, d1, d2, domain, adults)
             captured.clear()
             try:
                 pg.goto(url, timeout=90000, wait_until="domcontentloaded")
                 pg.wait_for_timeout(8000)
-                if pg.locator("#px-captcha").count():
-                    _solve_px(pg)
-                    pg.goto(url, timeout=90000, wait_until="domcontentloaded")
+                _solve_px(url)
                 for attempt in range(12):
                     pg.wait_for_timeout(5000)
                     if captured:
                         break
                 if captured:
                     best_body = max(captured, key=len)
-                    total, deals = _parse_skyscanner_payload(best_body, domain)
+                    total, deals = _parse_skyscanner_payload(
+                        best_body, domain, currency
+                    )
                     rows.append((origin, dest, d1, d2, total, deals))
                     log.info(
                         "skyscanner %s->%s %s..%s: %d results, top %s",
@@ -446,18 +817,21 @@ def skyscanner_spotcheck(cfg, conn, combos):
                         d1,
                         d2,
                     )
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - isolate each source query
                 log.warning("skyscanner %s->%s failed: %s", origin, dest, str(e)[:120])
             time.sleep(random.uniform(5, 10))
     return rows
 
 
-def _ss_eur(price_raw, price_fmt, huf_per_eur, gbp_per_eur):
-    if "Ft" in price_fmt:
+def _ss_eur(price_raw, currency, huf_per_eur, eur_per_gbp):
+    currency = currency.upper()
+    if currency == "HUF":
         return price_raw / huf_per_eur
-    if "£" in price_fmt:
-        return price_raw / gbp_per_eur
-    return price_raw
+    if currency == "GBP":
+        return price_raw * eur_per_gbp
+    if currency == "EUR":
+        return price_raw
+    raise ValueError(f"unsupported Skyscanner currency: {currency}")
 
 
 def run_skyscanner_if_due(cfg, conn, args, itins):
@@ -468,8 +842,12 @@ def run_skyscanner_if_due(cfg, conn, args, itins):
     if args.no_skyscanner or getattr(args, "rank_only", False):
         return
     s = cfg["search"]
+    adults = s.get("adults", 2)
+    state_suffix = f"v{CACHE_VERSION}_{adults}"
+    last_run_key = f"skyscanner_last_run_{state_suffix}"
+    cursor_key = f"skyscanner_discover_cursor_{state_suffix}"
     last = conn.execute(
-        "SELECT value FROM state WHERE key='skyscanner_last_run'"
+        "SELECT value FROM state WHERE key=?", (last_run_key,)
     ).fetchone()
     if last:
         age = _age_hours(last[0])
@@ -509,58 +887,78 @@ def run_skyscanner_if_due(cfg, conn, args, itins):
     n_google = len(combos)
 
     n_discovery = max(0, n_total - n_google)
+    cursor = 0
+
+    oj_map = {}
+    rt_map = {}
+    for it in itins:
+        key = _combo(it)
+        if it["kind"] == "OJ":
+            cur = oj_map.get(key)
+            if cur is None or it["airfare"] < cur:
+                oj_map[key] = it["airfare"]
+        elif it["kind"] == "RT":
+            rt_map.setdefault(key, it["airfare"])
 
     if n_discovery:
+        cutoff = (
+            datetime.now(timezone.utc)
+            - timedelta(hours=sk_cfg.get("max_age_hours", 36))
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
         existing = {
             (r[0], r[1], r[2], r[3])
-            for r in conn.execute("SELECT origin, dest, d1, d2 FROM skyscanner_prices")
+            for r in conn.execute(
+                "SELECT origin, dest, d1, d2 FROM skyscanner_prices "
+                "WHERE adults=? AND fetched_at>=?",
+                (adults, cutoff),
+            )
         }
 
         winner_adjacent = []
         for r in conn.execute(
-            "SELECT origin, dest, d1, d2, deals_json FROM skyscanner_prices"
+            "SELECT origin, dest, d1, d2, deals_json FROM skyscanner_prices "
+            "WHERE adults=? AND fetched_at>=?",
+            (adults, cutoff),
         ):
             deals = json.loads(r[4])
             if not deals:
                 continue
             best = min(d["eur"] for d in deals)
-            g = conn.execute(
-                "SELECT MIN(price) FROM price_cache WHERE kind='RT' AND origin=? AND dest=? AND d1=? AND d2=?",
-                (r[0], r[1], r[2], r[3]),
-            ).fetchone()[0]
+            g = rt_map.get((r[0], r[1], r[2], r[3]))
             if g is not None and g - best > 100:
-                from datetime import datetime as _dt
-
                 d1d = date.fromisoformat(r[2])
                 d2d = date.fromisoformat(r[3])
-                for k in (1, 2, 3):
+                for k in (-3, -2, -1, 1, 2, 3):
+                    shifted_d1 = d1d + timedelta(days=k)
+                    shifted_d2 = d2d + timedelta(days=k)
+                    if not (
+                        date.fromisoformat(s["date_start"])
+                        <= shifted_d1
+                        < shifted_d2
+                        <= date.fromisoformat(s["date_end"])
+                    ):
+                        continue
                     candidate = (
                         r[0],
                         r[1],
-                        (d1d + timedelta(days=k)).isoformat(),
-                        (d2d + timedelta(days=k)).isoformat(),
+                        shifted_d1.isoformat(),
+                        shifted_d2.isoformat(),
                     )
                     if candidate not in seen and candidate not in existing:
+                        seen.add(candidate)
                         winner_adjacent.append(candidate)
         combos.extend(winner_adjacent[:2])
 
-        oj_map = {}
-        rt_map = {}
-        for it in itins:
-            key = _combo(it)
-            if it["kind"] == "OJ":
-                cur = oj_map.get(key)
-                if cur is None or it["airfare"] < cur:
-                    oj_map[key] = it["airfare"]
-            elif it["kind"] == "RT":
-                rt_map.setdefault(key, it["airfare"])
         gaps = sorted(
-            ((rt_map[k] - v, k) for k, v in oj_map.items() if k in rt_map),
+            (
+                (rt_map[k] - v, k)
+                for k, v in oj_map.items()
+                if k in rt_map and rt_map[k] - v > 50
+            ),
             reverse=True,
         )
-        cursor = 0
         cur_row = conn.execute(
-            "SELECT value FROM state WHERE key='skyscanner_discover_cursor'"
+            "SELECT value FROM state WHERE key=?", (cursor_key,)
         ).fetchone()
         if cur_row:
             try:
@@ -575,15 +973,8 @@ def run_skyscanner_if_due(cfg, conn, args, itins):
                     break
                 if key in existing or key in seen:
                     continue
-                if gap <= 50:
-                    break
                 seen.add(key)
                 combos.append(key)
-        conn.execute(
-            "INSERT INTO state (key, value) VALUES ('skyscanner_discover_cursor', ?)"
-            " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (str(cursor + n_discovery),),
-        )
     log.info(
         "skyscanner combos: %d google-top (origin-balanced) + %d discovery"
         " (winner-adjacent + largest RT-OJ gaps)",
@@ -595,25 +986,87 @@ def run_skyscanner_if_due(cfg, conn, args, itins):
     log.info("skyscanner spot-check starting for %d combos", len(combos))
     try:
         rows = skyscanner_spotcheck(cfg, conn, combos)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - secondary source cannot stop Google
         log.warning("skyscanner spot-check failed entirely: %s", str(e)[:200])
         return
-    now = now_iso()
-    top_deals = sk_cfg.get("top_deals", 10)
+    attempted_at = now_iso()
     huf = cfg["currency"]["huf_per_eur"]
-    gbp = cfg["currency"].get("gbp_per_eur", 1.17)
+    eur_per_gbp = cfg["currency"].get("eur_per_gbp", 1.17)
+    expected_currency = sk_cfg.get("currency", "HUF").upper()
+    normalized_rows = []
     for origin, dest, d1, d2, total, deals in rows:
         slim = []
-        for d in deals[: sk_cfg.get("top_deals", 10)]:
-            d = dict(d)
-            d["eur"] = round(_ss_eur(d["price_raw"], d["price_fmt"], huf, gbp), 0)
+        currencies = set()
+        for raw_deal in deals[: sk_cfg.get("top_deals", 10)]:
+            d = dict(raw_deal)
+            currency = (d.get("currency") or expected_currency).upper()
+            try:
+                party_eur = _ss_eur(d["price_raw"], currency, huf, eur_per_gbp)
+            except (KeyError, TypeError, ValueError) as e:
+                log.warning("skipping Skyscanner deal: %s", e)
+                continue
+            currencies.add(currency)
+            d["currency"] = currency
+            d["party_eur"] = round(party_eur, 2)
+            d["eur"] = round(party_eur / adults, 2)
             slim.append(d)
-        key = f"{origin}|{dest}|{d1}|{d2}"
+        if slim or total == 0:
+            row_currency = (
+                next(iter(currencies))
+                if len(currencies) == 1
+                else "MIXED"
+                if currencies
+                else expected_currency
+            )
+            normalized_rows.append((origin, dest, d1, d2, total, slim, row_currency))
+        else:
+            log.warning(
+                "skyscanner %s->%s %s..%s had no valid currency/price rows",
+                origin,
+                dest,
+                d1,
+                d2,
+            )
+    rows = normalized_rows
+    successful = {(r[0], r[1], r[2], r[3]) for r in rows}
+    for combo in combos:
+        attempt_key = "|".join((state_suffix, *combo))
+        if combo in successful:
+            conn.execute(
+                """INSERT INTO skyscanner_attempts
+                   (key, last_attempt_at, last_success_at, last_error)
+                   VALUES (?,?,?,NULL)
+                   ON CONFLICT(key) DO UPDATE SET
+                     last_attempt_at=excluded.last_attempt_at,
+                     last_success_at=excluded.last_success_at,
+                     last_error=NULL""",
+                (attempt_key, attempted_at, attempted_at),
+            )
+        else:
+            conn.execute(
+                """INSERT INTO skyscanner_attempts
+                   (key, last_attempt_at, last_success_at, last_error)
+                   VALUES (?,?,NULL,'no conclusive result')
+                   ON CONFLICT(key) DO UPDATE SET
+                     last_attempt_at=excluded.last_attempt_at,
+                     last_error=excluded.last_error""",
+                (attempt_key, attempted_at),
+            )
+    if not rows:
+        conn.commit()
+        log.warning(
+            "skyscanner spot-check produced no conclusive results; retry remains due"
+        )
+        return
+
+    for origin, dest, d1, d2, total, slim, row_currency in rows:
+        key = f"{state_suffix}|{origin}|{dest}|{d1}|{d2}"
         conn.execute(
-            "INSERT INTO skyscanner_prices (key, origin, dest, d1, d2, total_results, deals_json, fetched_at)"
-            " VALUES (?,?,?,?,?,?,?,?)"
+            "INSERT INTO skyscanner_prices (key, origin, dest, d1, d2, total_results, deals_json, fetched_at, adults, currency)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT(key) DO UPDATE SET total_results=excluded.total_results,"
-            " deals_json=excluded.deals_json, fetched_at=excluded.fetched_at",
+            " deals_json=excluded.deals_json, fetched_at=excluded.fetched_at,"
+            " adults=excluded.adults, currency=excluded.currency",
             (
                 key,
                 origin,
@@ -622,25 +1075,33 @@ def run_skyscanner_if_due(cfg, conn, args, itins):
                 d2,
                 total,
                 json.dumps(slim, ensure_ascii=False),
-                now_iso(),
+                attempted_at,
+                adults,
+                row_currency,
             ),
         )
     conn.execute(
-        "INSERT INTO state (key, value) VALUES ('skyscanner_last_run', ?)"
+        "INSERT INTO state (key, value) VALUES (?, ?)"
         " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (now_iso(),),
+        (last_run_key, attempted_at),
     )
+    if n_discovery:
+        conn.execute(
+            "INSERT INTO state (key, value) VALUES (?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (cursor_key, str(cursor + n_discovery)),
+        )
     conn.commit()
     log.info("skyscanner spot-check stored %d combos", len(rows))
 
 
-def fetch_return_legs(client, page_html, best):
+def fetch_return_legs(client, page_html, best, gate=None):
     """Replay the 'Select flight' RPC: returns the actual return itineraries
     bookable in combination with the given (selected) outbound."""
     extras = _rpc_extras(page_html)
     if not extras or not best.get("blob") or not best.get("legs"):
         return []
-    token, fsid, bl, req_json = extras
+    _, fsid, bl, req_json = extras
     inner2 = json.loads(json.dumps(req_json[1]))
     li = _find_legs_index(inner2)
     if li is None:
@@ -656,7 +1117,7 @@ def fetch_return_legs(client, page_html, best):
     tail = out_leg[-1]
     legs[0] = [*base, d1, None, segs, None, None, None, None, None, tail]
     inner_req = [[None, best["blob"]], inner2, 0, 0, 0, 1]
-    resp = _rpc_post(client, fsid, bl, inner_req)
+    resp = _rpc_post(client, fsid, bl, inner_req, gate)
     if resp.status_code != 200:
         return []
     return _parse_rpc_itins(resp.text)
@@ -687,7 +1148,7 @@ def _suggestions(payload):
 
 
 def parse_payload(html_text):
-    m = re.search(r"<script[^>]*ds:1[^>]*>(.*?)</script>", html_text, re.S)
+    m = re.search(r"<script[^>]*ds:1[^>]*>(.*?)</script>", html_text, re.DOTALL)
     if not m:
         raise RuntimeError("no data script found in page")
     js = m.group(1)
@@ -709,22 +1170,24 @@ def parse_payload(html_text):
     return itins, suggestions
 
 
-def fetch_with_retry(q, attempts=3):
+def fetch_with_retry(q, attempts=3, gate=None):
     last = None
     for i in range(attempts):
-        client, page = fetch_html(q)
         try:
+            client, page = fetch_html(q, gate)
             itins, suggestions = parse_payload(page)
             if not itins and suggestions:
-                rpc = fetch_rpc_itins(client, page)
-                if rpc:
-                    return rpc, None, suggestions, client, page
-                return [], None, suggestions, client, page
+                rpc = fetch_rpc_itins(client, page, gate)
+                return rpc, None, suggestions, client, page
             if itins:
                 return itins, None, [], client, page
-            return [], None, [], client, page
-        except Exception as e:
+            raise RuntimeError("Google page had no itineraries or date suggestions")
+        except Exception as e:  # noqa: BLE001 - retry all transport/parser failures
             last = f"{type(e).__name__}: {e}"
+            if gate and any(
+                x in last.lower() for x in ("captcha", "http 403", "http 429")
+            ):
+                gate.cooldown(60)
             if i < attempts - 1:
                 delay = 2 + i * 3 + random.random() * 2
                 log.warning(
@@ -738,17 +1201,51 @@ def fetch_with_retry(q, attempts=3):
     return None, last, [], None, None
 
 
-def summarize(itins):
-    best = min(itins, key=lambda f: f["price"])
+def normalize_per_person(itins, adults):
+    for itin in itins:
+        party_price = float(itin["price"])
+        itin["party_price"] = party_price
+        itin["price"] = party_price / adults
+    return itins
+
+
+def itinerary_matches(itin, origin, dest, departure):
+    legs = itin.get("legs") or []
+    if not legs:
+        return False
+    valid_origins = CITIES.get(origin, {origin})
+    valid_destinations = CITIES.get(dest, {dest})
+    return (
+        legs[0].get("from") in valid_origins
+        and legs[-1].get("to") in valid_destinations
+        and legs[0].get("date") == departure
+    )
+
+
+def eligible_itineraries(itins, cfg):
+    max_hours = cfg.get("ranking", {}).get("max_leg_hours", 0)
+    return [i for i in itins if not max_hours or i.get("dur_h", 0) <= max_hours]
+
+
+def summarize(itins, cfg):
+    eligible = eligible_itineraries(itins, cfg)
+    max_hours = cfg.get("ranking", {}).get("max_leg_hours", 0)
+    if not eligible:
+        raise RuntimeError(f"all {len(itins)} itineraries exceed {max_hours}h")
+    best = min(eligible, key=lambda f: f["price"])
     detail = dict(best)
     detail["n_results"] = len(itins)
+    detail["n_eligible"] = len(eligible)
     return float(best["price"]), detail
 
 
 def key_of(kind, origin, dest, d1, d2, cfg):
     s = cfg["search"]
     tail = f"{d1}|{d2 or ''}"
-    return f"{kind}|{s['max_stops']}|{s['checked_bags']}|{origin}|{dest}|{tail}"
+    return (
+        f"v{CACHE_VERSION}|{kind}|economy|EUR|en|{s.get('adults', 2)}|"
+        f"{s['max_stops']}|{s['checked_bags']}|{origin}|{dest}|{tail}"
+    )
 
 
 def plan_queries(cfg):
@@ -791,52 +1288,38 @@ def run_scan(cfg, conn, args, run_ts):
         cfg["search"]["step_days"] = args.step
     s = cfg["search"]
     all_queries = plan_queries(cfg)
-    todo = []
+    stale = []
     if args.rank_only:
         log.info("--rank-only: skipping all fetching, rebuilding from cache")
-    else:
-        now = time.time()
-        for spec in all_queries:
-            kind, origin, dest, d1, d2 = spec
-            key = key_of(kind, origin, dest, d1, d2, cfg)
-            row = conn.execute(
-                "SELECT price, fetched_at, detail FROM price_cache WHERE key=?", (key,)
-            ).fetchone()
-            if args.force or row is None or row[1] is None:
-                todo.append((spec, key))
-            else:
-                no_exact = row[2] is not None and "no_exact_results" in row[2]
-                age = (
-                    now
-                    - datetime.fromisoformat(row[1].replace("Z", "+00:00")).timestamp()
-                )
-                if age > ttl or (row[0] is None and not no_exact):
-                    todo.append((spec, key))
-    if args.limit and len(todo) > args.limit:
-        cursor = 0
-        cur_row = conn.execute(
-            "SELECT value FROM state WHERE key='scan_cursor'"
+    now = time.time()
+    for spec in all_queries:
+        kind, origin, dest, d1, d2 = spec
+        key = key_of(kind, origin, dest, d1, d2, cfg)
+        row = conn.execute(
+            "SELECT price, fetched_at, detail, last_attempt_at "
+            "FROM price_cache WHERE key=?",
+            (key,),
         ).fetchone()
-        if cur_row:
-            try:
-                cursor = int(cur_row[0])
-            except ValueError:
-                cursor = 0
-        off = cursor % len(todo)
-        stale_total = len(todo)
-        todo = todo[off:] + todo[:off]
+        if args.force or row is None or row[1] is None:
+            stale.append((row[3] if row and row[3] else "", spec, key))
+        else:
+            no_exact = row[2] is not None and "no_exact_results" in row[2]
+            age = (
+                now - datetime.fromisoformat(row[1].replace("Z", "+00:00")).timestamp()
+            )
+            if age > ttl or (row[0] is None and not no_exact):
+                stale.append((row[3] or row[1] or "", spec, key))
+    stale.sort(key=lambda item: item[0])
+    stale_total = len(stale)
+    todo = [(spec, key) for _, spec, key in stale]
+    if args.rank_only:
+        todo = []
+    if args.limit and len(todo) > args.limit:
         todo = todo[: args.limit]
-        conn.execute(
-            "INSERT INTO state (key, value) VALUES ('scan_cursor', ?)"
-            " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (str(cursor + args.limit),),
-        )
-        conn.commit()
         log.info(
-            "rotated scan window: offset %d of %d stale queries (cursor=%d)",
-            off,
+            "selected %d oldest of %d stale queries",
+            len(todo),
             stale_total,
-            cursor + args.limit,
         )
 
     log.info(
@@ -857,14 +1340,23 @@ def run_scan(cfg, conn, args, run_ts):
         args.limit or "none",
     )
     log.info(
-        "%d planned queries: %d to fetch, %d served from cache",
+        "%d planned queries: %d to fetch, %d fresh in cache, %d stale deferred",
         len(all_queries),
         len(todo),
-        len(all_queries) - len(todo),
+        len(all_queries) - stale_total,
+        stale_total - len(todo),
     )
 
     lock = threading.Lock()
-    progress = {"n": 0, "fail": 0, "empty": 0, "cached": len(all_queries) - len(todo)}
+    progress = {
+        "n": 0,
+        "fail": 0,
+        "empty": 0,
+        "cached": len(all_queries) - stale_total,
+        "deferred": stale_total - len(todo),
+        "selected": len(todo),
+    }
+    gate = RequestGate(scan.get("requests_per_second", 2.0))
     scan_start = time.time()
 
     def work(item):
@@ -872,37 +1364,104 @@ def run_scan(cfg, conn, args, run_ts):
         kind, origin, dest, d1, d2 = spec
         q = build_query(kind, origin, dest, d1, d2, cfg)
         t0 = time.time()
-        out = fetch_with_retry(q)
-        return spec, key, q, out, time.time() - t0
+        out = fetch_with_retry(q, gate=gate)
+        return spec, key, out, time.time() - t0
 
     consec_fail = 0
-    futures = []
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        for item in todo:
-            futures.append(ex.submit(work, item))
+        futures = {ex.submit(work, item): item for item in todo}
         for fut in as_completed(futures):
-            spec, key, q, out, elapsed = fut.result()
+            try:
+                spec, key, out, elapsed = fut.result()
+            except Exception as e:  # noqa: BLE001 - contain individual futures
+                spec, key = futures[fut]
+                out = (None, f"{type(e).__name__}: {e}", [], None, None)
+                elapsed = 0.0
             itins, err, suggestions, client, page = out
             fetched = now_iso()
             price = None
             detail = None
             n_results = 0
             if itins:
-                price, detail = summarize(itins)
-                n_results = len(itins)
-                if spec[0] == "RT" and client is not None:
-                    try:
-                        rets = fetch_return_legs(client, page, detail)
-                        if rets:
-                            best_ret = min(rets, key=lambda r: r["price"])
-                            detail["ret"] = {
-                                k: v
-                                for k, v in best_ret.items()
-                                if k not in ("blob", "legs")
-                            }
-                    except Exception as e:
-                        log.warning("return-leg fetch failed for %s: %s", key, e)
-                detail = json.dumps(detail, ensure_ascii=False)
+                try:
+                    itins = [
+                        itin
+                        for itin in itins
+                        if itinerary_matches(itin, spec[1], spec[2], spec[3])
+                        and itin.get("stops", 0) <= s["max_stops"]
+                    ]
+                    if not itins:
+                        raise RuntimeError(
+                            "Google returned no itineraries matching requested route/date"
+                        )
+                    normalize_per_person(itins, s.get("adults", 2))
+                    price, detail = summarize(itins, cfg)
+                    n_results = len(itins)
+                    if spec[0] == "RT" and client is not None:
+                        try:
+                            eligible_outbounds = sorted(
+                                eligible_itineraries(itins, cfg),
+                                key=lambda candidate: candidate["price"],
+                            )
+                            for outbound in eligible_outbounds:
+                                candidate_detail = dict(outbound)
+                                candidate_detail["n_results"] = len(itins)
+                                candidate_detail["n_eligible"] = len(eligible_outbounds)
+                                raw_rets = fetch_return_legs(
+                                    client, page, candidate_detail, gate
+                                )
+                                if not raw_rets:
+                                    price = float(outbound["price"])
+                                    detail = candidate_detail
+                                    break
+                                max_hours = cfg.get("ranking", {}).get(
+                                    "max_leg_hours", 0
+                                )
+                                rets = [
+                                    ret
+                                    for ret in raw_rets
+                                    if itinerary_matches(ret, spec[2], spec[1], spec[4])
+                                    and ret.get("stops", 0) <= s["max_stops"]
+                                    and (
+                                        not max_hours
+                                        or not ret.get("dur_h")
+                                        or ret["dur_h"] <= max_hours
+                                    )
+                                ]
+                                if not rets:
+                                    continue
+                                normalize_per_person(rets, s.get("adults", 2))
+                                ret_price, best_ret = summarize(rets, cfg)
+                                initial_price = float(outbound["price"])
+                                candidate_detail["ret"] = {
+                                    k: v
+                                    for k, v in best_ret.items()
+                                    if k not in ("blob", "legs")
+                                }
+                                candidate_detail["paired_price"] = ret_price
+                                candidate_detail["paired_price_mismatch"] = round(
+                                    ret_price - initial_price, 2
+                                )
+                                candidate_detail["initial_summary_price"] = (
+                                    initial_price
+                                )
+                                candidate_detail["price"] = ret_price
+                                detail = candidate_detail
+                                price = ret_price
+                                break
+                            else:
+                                raise ReturnValidationError(
+                                    "no outbound had a route/date/duration-valid return"
+                                )
+                        except ReturnValidationError:
+                            raise
+                        except Exception as e:  # noqa: BLE001 - fare remains usable
+                            log.warning("return-leg fetch failed for %s: %s", key, e)
+                    detail = json.dumps(detail, ensure_ascii=False)
+                except Exception as e:  # noqa: BLE001 - convert to cached attempt error
+                    err = f"{type(e).__name__}: {e}"
+                    price = None
+                    detail = json.dumps({"error": err})
             elif err is None:
                 detail = json.dumps(
                     {"no_exact_results": True, "suggestions": suggestions},
@@ -914,15 +1473,14 @@ def run_scan(cfg, conn, args, run_ts):
                 progress["n"] += 1
                 if err is not None:
                     progress["fail"] += 1
-                n, f_, c = progress["n"], progress["fail"], progress["cached"]
-                done = n + c
+                n = progress["n"]
             tag = f"{spec[0]} {spec[1]}->{spec[2]} {spec[3]}..{spec[4] or ''}"
-            if price is not None:
+            if err is None and price is not None:
                 consec_fail = 0
                 log.info(
                     "[%d/%d] %s: %.0f EUR, %d itineraries, best %s, %.1fs",
-                    done,
-                    len(all_queries),
+                    n,
+                    len(todo),
                     tag,
                     price,
                     n_results,
@@ -938,8 +1496,8 @@ def run_scan(cfg, conn, args, run_ts):
                 )
                 log.info(
                     "[%d/%d] %s: no exact results (nearby: %s%s), %.1fs",
-                    done,
-                    len(all_queries),
+                    n,
+                    len(todo),
                     tag,
                     sugg_txt or "none",
                     f" +{len(suggestions) - 4} more" if len(suggestions) > 4 else "",
@@ -955,12 +1513,12 @@ def run_scan(cfg, conn, args, run_ts):
                         consec_fail,
                         pause,
                     )
-                    time.sleep(pause)
+                    gate.cooldown(pause)
                     consec_fail = 0
                 log.warning(
                     "[%d/%d] %s: FAILED after retries (%s), %.1fs",
-                    done,
-                    len(all_queries),
+                    n,
+                    len(todo),
                     tag,
                     err,
                     elapsed,
@@ -968,33 +1526,65 @@ def run_scan(cfg, conn, args, run_ts):
             prev = conn.execute(
                 "SELECT price, fetched_at FROM price_cache WHERE key=?", (key,)
             ).fetchone()
-            conn.execute(
-                """INSERT INTO price_cache
-                   (key, kind, origin, dest, d1, d2, price, n_results, detail,
-                    prev_price, prev_fetched_at, fetched_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-                   ON CONFLICT(key) DO UPDATE SET
-                     price=excluded.price, n_results=excluded.n_results,
-                     detail=excluded.detail,
-                     prev_price=excluded.prev_price,
-                     prev_fetched_at=excluded.prev_fetched_at,
-                     fetched_at=excluded.fetched_at""",
-                (
-                    key,
-                    spec[0],
-                    spec[1],
-                    spec[2],
-                    spec[3],
-                    spec[4],
-                    price,
-                    n_results,
-                    detail,
-                    prev[0] if prev else None,
-                    prev[1] if prev else None,
-                    fetched,
-                ),
-            )
-            if price is not None:
+            if err is not None:
+                if prev:
+                    conn.execute(
+                        "UPDATE price_cache SET last_attempt_at=?, last_error=? WHERE key=?",
+                        (fetched, err, key),
+                    )
+                else:
+                    conn.execute(
+                        """INSERT INTO price_cache
+                           (key, kind, origin, dest, d1, d2, price, n_results,
+                            detail, fetched_at, last_attempt_at, last_error)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            key,
+                            spec[0],
+                            spec[1],
+                            spec[2],
+                            spec[3],
+                            spec[4],
+                            None,
+                            0,
+                            detail,
+                            None,
+                            fetched,
+                            err,
+                        ),
+                    )
+            else:
+                conn.execute(
+                    """INSERT INTO price_cache
+                       (key, kind, origin, dest, d1, d2, price, n_results, detail,
+                        prev_price, prev_fetched_at, fetched_at, last_attempt_at,
+                        last_error)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)
+                       ON CONFLICT(key) DO UPDATE SET
+                         price=excluded.price, n_results=excluded.n_results,
+                         detail=excluded.detail,
+                         prev_price=excluded.prev_price,
+                         prev_fetched_at=excluded.prev_fetched_at,
+                         fetched_at=excluded.fetched_at,
+                         last_attempt_at=excluded.last_attempt_at,
+                         last_error=NULL""",
+                    (
+                        key,
+                        spec[0],
+                        spec[1],
+                        spec[2],
+                        spec[3],
+                        spec[4],
+                        price,
+                        n_results,
+                        detail,
+                        prev[0] if prev else None,
+                        prev[1] if prev else None,
+                        fetched,
+                        fetched,
+                    ),
+                )
+            if err is None and price is not None:
                 conn.execute(
                     "INSERT INTO price_history (key, price, fetched_at) VALUES (?,?,?)",
                     (key, price, fetched),
@@ -1002,12 +1592,13 @@ def run_scan(cfg, conn, args, run_ts):
             conn.commit()
 
     log.info(
-        "scan finished in %.0fs: fetched=%d failed=%d empty=%d cached=%d",
+        "scan finished in %.0fs: fetched=%d failed=%d empty=%d fresh=%d deferred=%d",
         time.time() - scan_start,
         progress["n"],
         progress["fail"],
         progress["empty"],
         progress["cached"],
+        progress["deferred"],
     )
     return progress
 
@@ -1034,12 +1625,20 @@ def transfers_for(kind, out_origin, ret_dest, cfg):
     return total, items
 
 
-def load_rows(conn):
+def load_rows(conn, cfg):
     rows = {}
     for r in conn.execute(
-        "SELECT kind, origin, dest, d1, d2, price, detail, fetched_at FROM price_cache WHERE price IS NOT NULL"
+        "SELECT key, kind, origin, dest, d1, d2, price, detail, fetched_at "
+        "FROM price_cache WHERE price IS NOT NULL"
     ):
-        kind, origin, dest, d1, d2, price, detail, fetched_at = r
+        key, kind, origin, dest, d1, d2, price, detail, fetched_at = r
+        if key != key_of(kind, origin, dest, d1, d2, cfg):
+            continue
+        max_age = cfg.get("cache", {}).get("max_rank_age_hours", 12)
+        if max_age and (
+            _age_hours(fetched_at) is None or _age_hours(fetched_at) > max_age
+        ):
+            continue
         d = json.loads(detail) if detail else {}
         d.setdefault("airlines", [])
         d.setdefault("route", "")
@@ -1049,21 +1648,80 @@ def load_rows(conn):
     return rows
 
 
+def load_ss_rows(conn, cfg):
+    prefix = f"v{CACHE_VERSION}_{cfg['search'].get('adults', 2)}|%"
+    return conn.execute(
+        "SELECT origin, dest, d1, d2, total_results, deals_json, fetched_at, "
+        "adults, currency FROM skyscanner_prices WHERE key LIKE ? "
+        "ORDER BY fetched_at DESC",
+        (prefix,),
+    ).fetchall()
+
+
 def _ss_itineraries(cfg, ss_rows, rt_prices):
     """Synthesize itineraries from Skyscanner deals, merged into the ranking.
     Only deals cheaper than the Google round-trip for the same pair are kept."""
     out = []
-    for origin, dest, d1, d2, total_results, deals_json in ss_rows:
+    s = cfg["search"]
+    max_hours = cfg.get("ranking", {}).get("max_leg_hours", 0)
+    max_age = cfg.get("skyscanner", {}).get("max_age_hours", 36)
+    bag_estimate = cfg.get("skyscanner", {}).get("checked_bag_estimate_eur", 0)
+    start = date.fromisoformat(s["date_start"])
+    end = date.fromisoformat(s["date_end"])
+    for (
+        origin,
+        dest,
+        d1,
+        d2,
+        _total_results,
+        deals_json,
+        fetched_at,
+        adults,
+        _currency,
+    ) in ss_rows:
+        dep_date = date.fromisoformat(d1)
+        ret_date = date.fromisoformat(d2)
+        duration = (ret_date - dep_date).days
+        age = _age_hours(fetched_at)
+        if (
+            adults != s.get("adults", 2)
+            or origin not in s["origins"]
+            or dest not in s["destinations"]
+            or not start <= dep_date < ret_date <= end
+            or not s["trip_min_days"] <= duration <= s["trip_max_days"]
+            or age is None
+            or age > max_age
+        ):
+            continue
         deals = json.loads(deals_json)
         if not deals:
             continue
         g = rt_prices.get((origin, dest, d1, d2))
-        for deal in deals[:2]:
+        accepted_keys = set()
+        valid_destinations = {dest, *CITIES.get(dest, set())}
+        for deal in deals:
             eur = deal.get("eur")
-            if eur is None or (g is not None and eur >= g):
+            legs = deal.get("legs") or []
+            if (
+                eur is None
+                or g is None
+                or eur + bag_estimate >= g
+                or len(legs) != 2
+                or legs[0].get("from") != origin
+                or legs[0].get("to") not in valid_destinations
+                or (legs[0].get("dep") or "")[:10] != d1
+                or legs[1].get("from") not in valid_destinations
+                or legs[1].get("to") != origin
+                or (legs[1].get("dep") or "")[:10] != d2
+                or any((leg.get("stops") or 0) > s["max_stops"] for leg in legs)
+                or any(
+                    max_hours and leg.get("dur_min") and leg["dur_min"] / 60 > max_hours
+                    for leg in legs
+                )
+            ):
                 continue
             leg_details = []
-            for leg in deal["legs"]:
+            for leg in legs:
                 dep, arr = leg.get("dep", ""), leg.get("arr", "")
                 plus = 0
                 dur_h = None
@@ -1083,15 +1741,37 @@ def _ss_itineraries(cfg, ss_rows, rt_prices):
                         "dur_h": dur_h,
                         "airlines": [c for c in leg.get("carriers", []) if c],
                         "airports": {},
+                        "fetched_at": fetched_at,
                     }
                 )
             while len(leg_details) < 2:
                 leg_details.append(None)
             tr_total, tr_items = transfers_for("RT", origin, origin, cfg)
             agent = ", ".join(deal.get("agents", [])[:1])
+            identity = json.dumps(
+                {
+                    "route": [origin, dest, d1, d2],
+                    "agents": deal.get("agents", []),
+                    "legs": [
+                        {
+                            "from": leg.get("from"),
+                            "to": leg.get("to"),
+                            "dep": leg.get("dep"),
+                            "arr": leg.get("arr"),
+                            "carriers": leg.get("carriers", []),
+                        }
+                        for leg in legs
+                    ],
+                    "self_transfer": bool(deal.get("self_transfer")),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            digest = hashlib.sha256(identity.encode()).hexdigest()[:16]
+            itinerary_key = f"SS|{origin}|{dest}|{d1}|{d2}|{digest}"
             out.append(
                 {
-                    "key": f"SS|{origin}|{dest}|{d1}|{d2}|{deal['price_fmt']}",
+                    "key": itinerary_key,
                     "kind": "SS",
                     "out_origin": origin,
                     "ret_dest": origin,
@@ -1099,7 +1779,9 @@ def _ss_itineraries(cfg, ss_rows, rt_prices):
                     "out_city": dest,
                     "d1": d1,
                     "d2": d2,
-                    "airfare": eur,
+                    "airfare": eur + bag_estimate,
+                    "ota_base_fare": eur,
+                    "bag_estimate": bag_estimate,
                     "out_detail": leg_details[0],
                     "ret_detail": leg_details[1],
                     "ret_unavailable": False,
@@ -1107,11 +1789,23 @@ def _ss_itineraries(cfg, ss_rows, rt_prices):
                     "transfer_items": tr_items,
                     "agent": agent,
                     "link": deal.get("link"),
+                    "self_transfer": bool(deal.get("self_transfer")),
+                    "protected": bool(deal.get("protected")),
+                    "bag_included": False,
+                    "fetched_at": fetched_at,
                 }
             )
+            accepted_keys.add(itinerary_key)
+            if len(accepted_keys) == 2:
+                break
     for it in out:
         it["total"] = it["airfare"] + it["transfers"]
-    return out
+    deduplicated = {}
+    for it in out:
+        current = deduplicated.get(it["key"])
+        if current is None or it["total"] < current["total"]:
+            deduplicated[it["key"]] = it
+    return list(deduplicated.values())
 
 
 def build_itineraries(cfg, rows, ss_rows=None):
@@ -1126,6 +1820,13 @@ def build_itineraries(cfg, rows, ss_rows=None):
         d += timedelta(days=step)
 
     itins = []
+    max_hours = cfg.get("ranking", {}).get("max_leg_hours", 0)
+
+    def allowed(detail):
+        return bool(detail) and (
+            not max_hours or not detail.get("dur_h") or detail["dur_h"] <= max_hours
+        )
+
     for origin in s["origins"]:
         for dest in s["destinations"]:
             for d1 in dep_dates:
@@ -1135,8 +1836,8 @@ def build_itineraries(cfg, rows, ss_rows=None):
                         continue
                     d1s, d2s = d1.isoformat(), d2.isoformat()
                     rt = rows.get(("RT", origin, dest, d1s, d2s))
-                    if rt:
-                        tr_total, tr_items = transfers_for("RT", origin, dest, cfg)
+                    if rt and allowed(rt):
+                        tr_total, tr_items = transfers_for("RT", origin, origin, cfg)
                         ret_detail = None
                         if isinstance(rt.get("ret"), dict):
                             ret_detail = dict(rt["ret"])
@@ -1151,7 +1852,7 @@ def build_itineraries(cfg, rows, ss_rows=None):
                                 "key": f"RT|{origin}|{dest}|{d1s}|{d2s}",
                                 "kind": "RT",
                                 "out_origin": origin,
-                                "ret_dest": dest,
+                                "ret_dest": origin,
                                 "in_city": dest,
                                 "out_city": dest,
                                 "d1": d1s,
@@ -1164,30 +1865,37 @@ def build_itineraries(cfg, rows, ss_rows=None):
                                 "transfer_items": tr_items,
                             }
                         )
-                    for in_city, out_city in [(OSA, TYO), (TYO, OSA)]:
-                        for home in s["origins"]:
-                            out_leg = rows.get(("OW", origin, in_city, d1s, ""))
-                            ret_leg = rows.get(("OW", out_city, home, d2s, ""))
-                            if not (out_leg and ret_leg):
-                                continue
-                            tr_total, tr_items = transfers_for("OJ", origin, home, cfg)
-                            itins.append(
-                                {
-                                    "key": f"OJ|{origin}|{home}|{in_city}|{out_city}|{d1s}|{d2s}",
-                                    "kind": "OJ",
-                                    "out_origin": origin,
-                                    "ret_dest": home,
-                                    "in_city": in_city,
-                                    "out_city": out_city,
-                                    "d1": d1s,
-                                    "d2": d2s,
-                                    "airfare": out_leg["price"] + ret_leg["price"],
-                                    "out_detail": out_leg,
-                                    "ret_detail": ret_leg,
-                                    "transfers": tr_total,
-                                    "transfer_items": tr_items,
-                                }
-                            )
+    for origin in s["origins"]:
+        for d1 in dep_dates:
+            for dur in range(s["trip_min_days"], s["trip_max_days"] + 1):
+                d2 = d1 + timedelta(days=dur)
+                if d2 > end:
+                    continue
+                d1s, d2s = d1.isoformat(), d2.isoformat()
+                for in_city, out_city in ((OSA, TYO), (TYO, OSA)):
+                    for home in s["origins"]:
+                        out_leg = rows.get(("OW", origin, in_city, d1s, ""))
+                        ret_leg = rows.get(("OW", out_city, home, d2s, ""))
+                        if not (allowed(out_leg) and allowed(ret_leg)):
+                            continue
+                        tr_total, tr_items = transfers_for("OJ", origin, home, cfg)
+                        itins.append(
+                            {
+                                "key": f"OJ|{origin}|{home}|{in_city}|{out_city}|{d1s}|{d2s}",
+                                "kind": "OJ",
+                                "out_origin": origin,
+                                "ret_dest": home,
+                                "in_city": in_city,
+                                "out_city": out_city,
+                                "d1": d1s,
+                                "d2": d2s,
+                                "airfare": out_leg["price"] + ret_leg["price"],
+                                "out_detail": out_leg,
+                                "ret_detail": ret_leg,
+                                "transfers": tr_total,
+                                "transfer_items": tr_items,
+                            }
+                        )
     for it in itins:
         it["total"] = it["airfare"] + it["transfers"]
     if ss_rows:
@@ -1197,8 +1905,22 @@ def build_itineraries(cfg, rows, ss_rows=None):
                 key = (it["out_origin"], it["in_city"], it["d1"], it["d2"])
                 rt_prices.setdefault(key, it["airfare"])
         itins.extend(_ss_itineraries(cfg, ss_rows, rt_prices))
+    keys = [it["key"] for it in itins]
+    if len(keys) != len(set(keys)):
+        raise RuntimeError("duplicate itinerary keys generated")
     itins.sort(key=lambda x: x["total"])
     return itins
+
+
+def build_with_optional_skyscanner(cfg, conn, rows):
+    google_itins = build_itineraries(cfg, rows)
+    try:
+        return build_itineraries(cfg, rows, load_ss_rows(conn, cfg))
+    except Exception:
+        log.exception(
+            "stored Skyscanner data is invalid; rendering Google-only results"
+        )
+        return google_itins
 
 
 def prev_totals(conn):
@@ -1223,7 +1945,15 @@ def fmt_date(iso):
 def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
     top_n = args.top or cfg["scan"]["top_n"]
     huf = cfg["currency"]["huf_per_eur"]
-    shown = itins[:top_n]
+    bucket_counts = {}
+    shown = []
+    for it in itins:
+        trip_days = (date.fromisoformat(it["d2"]) - date.fromisoformat(it["d1"])).days
+        bucket = (it["out_origin"], trip_days)
+        if bucket_counts.get(bucket, 0) >= top_n:
+            continue
+        bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
+        shown.append(it)
 
     best_rt = next((i for i in itins if i["kind"] == "RT"), None)
     best_oj = next((i for i in itins if i["kind"] == "OJ"), None)
@@ -1247,10 +1977,10 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
 
     def leg_cell(d, unavailable=False):
         if not d:
-            return "<td>—</td>"
+            return '<td data-sort-number="999999">—</td>'
         if unavailable:
             return (
-                "<td><small>return leg details not exposed by API</small><br>"
+                '<td data-sort-number="999999"><small>return leg details not exposed by API</small><br>'
                 f"<small>{', '.join(html.escape(a) for a in d.get('airlines', []))}</small></td>"
             )
         names = d.get("airports") or {}
@@ -1275,7 +2005,7 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
             else ""
         )
         return (
-            f"<td>{route_html}{stops_txt}<br>"
+            f'<td data-sort-number="{d.get("dur_h") or 999999}">{route_html}{stops_txt}<br>'
             f"<small>{times}</small><br>"
             f"<small>{', '.join(html.escape(a) for a in d.get('airlines', []))}</small>"
             f"{ref_txt}</td>"
@@ -1291,6 +2021,7 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
     ss_domain = cfg.get("skyscanner", {}).get("domain", "skyscanner.hu")
     for i, it in enumerate(shown, 1):
         o, r = it["out_detail"], it["ret_detail"]
+        trip_days = (date.fromisoformat(it["d2"]) - date.fromisoformat(it["d1"])).days
         kind_label = {
             "RT": "Round trip",
             "OJ": "Open jaw",
@@ -1321,7 +2052,12 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
                 (
                     "Skyscanner",
                     _ss_url(
-                        it["out_origin"], it["in_city"], it["d1"], it["d2"], ss_domain
+                        it["out_origin"],
+                        it["in_city"],
+                        it["d1"],
+                        it["d2"],
+                        ss_domain,
+                        cfg["search"].get("adults", 2),
                     ),
                 )
             )
@@ -1333,32 +2069,33 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
         idx = i - 1
         badge_cls = "badge" if it["kind"] in ("RT", "SS") else "badge oj"
         agent_html = (
-            f'<br><small class="muted">via {html.escape(it.get("agent", ""))}</small>'
+            f'<br><small class="muted">via {html.escape(it.get("agent", ""))}'
+            f"{' · self-transfer' if it.get('self_transfer') else ''}"
+            f"{' · protected' if it.get('protected') else ''}</small>"
             if it["kind"] == "SS"
             else ""
         )
         rows_html.append(
-            f'<tr data-eur-total="{it["total"]:.2f}" data-i="{idx}" title="click for details">'
+            f'<tr data-eur-total="{it["total"]:.2f}" data-origin="{html.escape(it["out_origin"])}" '
+            f'data-days="{trip_days}" data-i="{idx}" title="click for details">'
             f'<td class="rank">{i}</td><td><span class="{badge_cls}">{kind_label}</span>{agent_html}</td><td>{route_txt}</td>'
-            f"<td>{fmt_date(it['d1'])}</td><td>{fmt_date(it['d2'])}</td>"
-            f'<td class="num">{(date.fromisoformat(it["d2"]) - date.fromisoformat(it["d1"])).days}</td>'
+            f'<td data-sort="{it["d1"]}">{fmt_date(it["d1"])}</td>'
+            f'<td data-sort="{it["d2"]}">{fmt_date(it["d2"])}</td>'
+            f'<td class="num" data-sort-number="{trip_days}">{trip_days}</td>'
             f"{leg_cell(o)}"
             f"{leg_cell(r, unavailable=it.get('ret_unavailable', False))}"
-            f'<td class="num" data-eur="{it["airfare"]:.0f}">{it["airfare"]:.0f}</td>'
-            f'<td class="num" data-eur="{it["transfers"]:.0f}" title="{html.escape(tr_items)}">{it["transfers"]:.0f}</td>'
-            f'<td class="num total" data-eur="{it["total"]:.0f}">{it["total"]:.0f}</td>'
+            f'<td class="num" data-eur="{it["airfare"]:.0f}" data-sort-number="{it["airfare"]:.2f}">{it["airfare"]:.0f}</td>'
+            f'<td class="num" data-eur="{it["transfers"]:.0f}" data-sort-number="{it["transfers"]:.2f}" title="{html.escape(tr_items)}">{it["transfers"]:.0f}</td>'
+            f'<td class="num total" data-eur="{it["total"]:.0f}" data-sort-number="{it["total"]:.2f}">{it["total"]:.0f}</td>'
             f'<td class="num">{delta}</td><td>{links}</td></tr>'
         )
-        prev_total = prev.get(it["key"])
         shown_json.append(
             {
                 "kind_label": kind_label,
                 "route_txt": route_txt,
                 "d1": it["d1"],
                 "d2": it["d2"],
-                "days": (
-                    date.fromisoformat(it["d2"]) - date.fromisoformat(it["d1"])
-                ).days,
+                "days": trip_days,
                 "airfare": it["airfare"],
                 "transfers": it["transfers"],
                 "total": it["total"],
@@ -1368,6 +2105,12 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
                 "out": slim(o),
                 "ret": slim(r),
                 "ret_unavailable": it.get("ret_unavailable", False),
+                "self_transfer": it.get("self_transfer", False),
+                "protected": it.get("protected", False),
+                "bag_included": it.get("bag_included", True),
+                "ota_base_fare": it.get("ota_base_fare"),
+                "bag_estimate": it.get("bag_estimate"),
+                "fetched_at": it.get("fetched_at"),
             }
         )
 
@@ -1375,18 +2118,24 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
     chart_labels = []
     chart_series = {it["key"]: [] for it in hist_top}
     series_meta = {it["key"]: it for it in hist_top}
+    history_cutoff = (
+        datetime.now(timezone.utc)
+        - timedelta(days=cfg.get("history", {}).get("retention_days", 180))
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
     hist_rows = conn.execute(
-        "SELECT run_ts, itin_key, total FROM itinerary_history ORDER BY run_ts"
+        "SELECT run_ts, itin_key, total FROM itinerary_history "
+        "WHERE run_ts>=? ORDER BY run_ts",
+        (history_cutoff,),
     ).fetchall()
     by_run = {}
     for ts, k, total in hist_rows:
         by_run.setdefault(ts, {})[k] = total
-    all_run_ts = sorted(set([ts for ts, _, _ in hist_rows] + [run_ts]))
+    all_run_ts = sorted({ts for ts, _, _ in hist_rows})
     for ts in all_run_ts:
         short = ts[5:16].replace("T", " ")
         chart_labels.append(short)
-        for k in chart_series:
-            chart_series[k].append(by_run.get(ts, {}).get(k))
+        for k, values in chart_series.items():
+            values.append(by_run.get(ts, {}).get(k))
 
     best_per_run = []
     for ts in all_run_ts:
@@ -1426,7 +2175,7 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
     def fmt_run_ts(ts):
         if not ts:
             return "none"
-        d = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
+        d = datetime.fromisoformat(ts.replace("Z", "+00:00"))
         return d.strftime("%d %b %Y, %H:%M UTC")
 
     def _stats_age(ts):
@@ -1435,30 +2184,47 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
         dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
         return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
 
-    stats_q = {
-        "priced": "SELECT COUNT(*) FROM price_cache WHERE price IS NOT NULL",
-        "empty": "SELECT COUNT(*) FROM price_cache WHERE detail LIKE '%no_exact_results%'",
-        "by_kind": (
-            "SELECT kind, COUNT(*) FROM price_cache WHERE price IS NOT NULL"
-            " GROUP BY kind"
-        ),
-        "hist": "SELECT COUNT(*) FROM price_history",
-        "runs": "SELECT COUNT(*) FROM runs",
-        "oldest": "SELECT MIN(fetched_at) FROM price_cache WHERE price IS NOT NULL",
-        "newest": "SELECT MAX(fetched_at) FROM price_cache WHERE price IS NOT NULL",
-    }
-    priced = conn.execute(stats_q["priced"]).fetchone()[0]
-    empty = conn.execute(stats_q["empty"]).fetchone()[0]
-    kinds = dict(conn.execute(stats_q["by_kind"]).fetchall())
-    hist = conn.execute(stats_q["hist"]).fetchone()[0]
-    runs_n = conn.execute(stats_q["runs"]).fetchone()[0]
-    oldest = conn.execute(stats_q["oldest"]).fetchone()[0]
-    newest = conn.execute(stats_q["newest"]).fetchone()[0]
+    key_pattern = (
+        f"v{CACHE_VERSION}|%|economy|EUR|en|{cfg['search'].get('adults', 2)}|%"
+    )
+    priced = conn.execute(
+        "SELECT COUNT(*) FROM price_cache WHERE key LIKE ? AND price IS NOT NULL",
+        (key_pattern,),
+    ).fetchone()[0]
+    empty = conn.execute(
+        "SELECT COUNT(*) FROM price_cache WHERE key LIKE ? "
+        "AND detail LIKE '%no_exact_results%'",
+        (key_pattern,),
+    ).fetchone()[0]
+    kinds = dict(
+        conn.execute(
+            "SELECT kind, COUNT(*) FROM price_cache "
+            "WHERE key LIKE ? AND price IS NOT NULL GROUP BY kind",
+            (key_pattern,),
+        ).fetchall()
+    )
+    hist = conn.execute(
+        "SELECT COUNT(*) FROM price_history WHERE key LIKE ?", (key_pattern,)
+    ).fetchone()[0]
+    runs_n = conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+    oldest, newest = conn.execute(
+        "SELECT MIN(fetched_at), MAX(fetched_at) FROM price_cache "
+        "WHERE key LIKE ? AND price IS NOT NULL",
+        (key_pattern,),
+    ).fetchone()
     planned = len(plan_queries(cfg))
 
     kind_txt = " · ".join(f"{kinds[k]:,} {k}" for k in ("RT", "OW") if kinds.get(k))
     newest_age = _stats_age(newest)
     oldest_age = _stats_age(oldest)
+    freshness_note = None
+    if oldest_age is not None:
+        ttl = cfg["cache"]["ttl_hours"]
+        freshness_note = (
+            f"within {ttl}h refresh target"
+            if oldest_age <= ttl
+            else f"{oldest_age - ttl:.0f}h beyond {ttl}h refresh target"
+        )
     stat_items = [
         (f"{priced:,}", "prices tracked", kind_txt),
         (f"{priced + empty}/{planned}", "date pairs checked", f"{empty} flexible-only"),
@@ -1470,7 +2236,7 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
         (
             f"{oldest_age:.0f}h" if oldest_age is not None else "–",
             "stalest cached price",
-            f"refreshed within {cfg['cache']['ttl_hours']}h",
+            freshness_note,
         ),
         (f"{hist:,}", "history points", None),
         (f"{runs_n}", "runs recorded", None),
@@ -1478,6 +2244,11 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
             f"{progress['n']}",
             "fetched this run",
             f"{progress.get('empty', 0)} flexible-only, {progress['fail']} failed",
+        ),
+        (
+            f"{progress.get('deferred', 0)}",
+            "stale queries deferred",
+            None,
         ),
     ]
     stats_html = ""
@@ -1491,6 +2262,18 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
     html_doc = TEMPLATE
     html_doc = html_doc.replace("__RUN_TS__", run_ts)
     html_doc = html_doc.replace("__HUF__", str(huf))
+    html_doc = html_doc.replace("__ADULTS__", str(cfg["search"].get("adults", 2)))
+    html_doc = html_doc.replace("__MAX_STOPS__", str(cfg["search"]["max_stops"]))
+    html_doc = html_doc.replace("__TABLE_LIMIT__", str(top_n))
+    html_doc = html_doc.replace("__MIN_DAYS__", str(cfg["search"]["trip_min_days"]))
+    html_doc = html_doc.replace("__MAX_DAYS__", str(cfg["search"]["trip_max_days"]))
+    city_names = {"BUD": "Budapest", "VIE": "Vienna"}
+    origin_options = '<option value="">All departure cities</option>' + "".join(
+        f'<option value="{html.escape(origin)}">'
+        f"{html.escape(city_names.get(origin, origin))} ({html.escape(origin)})</option>"
+        for origin in cfg["search"]["origins"]
+    )
+    html_doc = html_doc.replace("__ORIGIN_OPTIONS__", origin_options)
     html_doc = html_doc.replace(
         "__CARDS__",
         card("Cheapest overall", itins[0] if itins else None, best=True)
@@ -1499,12 +2282,17 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
     )
     html_doc = html_doc.replace("__STATS__", stats_html)
     html_doc = html_doc.replace("__ROWS__", "\n".join(rows_html))
-    html_doc = html_doc.replace("__ITINS__", json.dumps(shown_json, ensure_ascii=False))
-    html_doc = html_doc.replace("__CHART_DATA__", json.dumps(chart_data))
-    html_doc = html_doc.replace("__BEST_CHART__", json.dumps(best_chart))
+
+    def script_json(value):
+        return json.dumps(value, ensure_ascii=False).replace("<", "\\u003c")
+
+    html_doc = html_doc.replace("__ITINS__", script_json(shown_json))
+    html_doc = html_doc.replace("__CHART_DATA__", script_json(chart_data))
+    html_doc = html_doc.replace("__BEST_CHART__", script_json(best_chart))
     html_doc = html_doc.replace(
         "__META__",
-        f"Generated {fmt_run_ts(run_ts)} · per-person prices · "
+        f"Generated {fmt_run_ts(run_ts)} · per-person prices from "
+        f"{cfg['search'].get('adults', 2)}-adult queries · "
         f"previous run: {fmt_run_ts(prev_ts)}",
     )
     html_doc = html_doc.replace(
@@ -1541,6 +2329,16 @@ TEMPLATE = """<!doctype html>
  .seg button { border: none; background: transparent; padding: 5px 16px;
                border-radius: 999px; cursor: pointer; font-size: .85rem; color: var(--muted); }
  .seg button.active { background: var(--text); color: #fff; }
+ .filters { display: flex; align-items: end; flex-wrap: wrap; gap: 8px; }
+ .filter { display: grid; gap: 3px; color: var(--muted); font-size: .68rem;
+           letter-spacing: .03em; text-transform: uppercase; }
+ .filter select, .filter input { height: 32px; border: 1px solid var(--line);
+           border-radius: 8px; background: var(--card); color: var(--text);
+           padding: 4px 9px; font: inherit; font-size: .8rem; letter-spacing: 0;
+           text-transform: none; }
+ .day-range { display: flex; align-items: center; gap: 5px; }
+ .day-range input { width: 62px; }
+ .match-count { color: var(--muted); font-size: .76rem; padding-bottom: 6px; }
  .stats { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 14px; }
  .stat { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
          padding: 6px 12px; font-size: .78rem; color: var(--muted); }
@@ -1632,6 +2430,10 @@ TEMPLATE = """<!doctype html>
    .cards { grid-template-columns: 1fr; gap: 8px; }
    .card { padding: 10px 14px; }
    .card-value { font-size: 1.3rem; }
+   .toolbar { align-items: flex-start; }
+   .filters { width: 100%; }
+   .filter:first-child { flex: 1; }
+   .filter select { width: 100%; }
    table { font-size: .72rem; }
    thead th { padding: 8px 6px; }
    tbody td { padding: 7px 6px; }
@@ -1651,6 +2453,19 @@ TEMPLATE = """<!doctype html>
    <button id="btn-eur" class="active" onclick="setCur('EUR')">EUR</button>
    <button id="btn-huf" onclick="setCur('HUF')">HUF</button>
   </div>
+  <div class="filters" aria-label="Table filters">
+   <label class="filter">Departure city
+    <select id="filter-origin">__ORIGIN_OPTIONS__</select>
+   </label>
+   <label class="filter">Trip days
+    <span class="day-range">
+     <input id="filter-days-min" type="number" min="__MIN_DAYS__" max="__MAX_DAYS__" value="__MIN_DAYS__" aria-label="Minimum trip days">
+     <span>to</span>
+     <input id="filter-days-max" type="number" min="__MIN_DAYS__" max="__MAX_DAYS__" value="__MAX_DAYS__" aria-label="Maximum trip days">
+    </span>
+   </label>
+   <span class="match-count" id="match-count" aria-live="polite"></span>
+  </div>
  </div>
  <div class="stats">__STATS__</div>
  <div class="cards">__CARDS__</div>
@@ -1668,7 +2483,9 @@ __ROWS__
 </tbody>
  </table>
  </div>
- <p class="foot">Prices per person, 1-adult query, checked bag included, max 2 stops.
+ <p class="foot">Prices per person from __ADULTS__-adult queries, max __MAX_STOPS__ stops.
+ Google fares request one checked bag; Skyscanner/OTA base fares add a conservative
+ configured checked-bag estimate and are labelled separately.
  Open jaw = sum of two one-ways (verify the true multi-city price via the GF links).
  Times are local; (+n) = arrival n days after departure; duration includes layovers.
  For round trips the return leg is the actual flight paired with the shown outbound when
@@ -1711,11 +2528,38 @@ document.querySelectorAll('#tbl th[data-k]').forEach(th => {
   th.addEventListener('click', () => sortBy(th));
 });
 let sortKey = 10, sortAsc = true;
+const TABLE_LIMIT = __TABLE_LIMIT__;
+function applyFilters() {
+  const origin = document.getElementById('filter-origin').value;
+  const rawMin = Number(document.getElementById('filter-days-min').value);
+  const rawMax = Number(document.getElementById('filter-days-max').value);
+  const minDays = Math.min(rawMin, rawMax), maxDays = Math.max(rawMin, rawMax);
+  const rows = [...document.querySelectorAll('#tbl tbody tr')];
+  let matching = 0, visible = 0;
+  rows.forEach(row => {
+    const match = (!origin || row.dataset.origin === origin) &&
+      Number(row.dataset.days) >= minDays && Number(row.dataset.days) <= maxDays;
+    if (match) matching++;
+    const show = match && visible < TABLE_LIMIT;
+    row.hidden = !show;
+    if (show) {
+      visible++;
+      row.querySelector('.rank').textContent = visible;
+    }
+  });
+  document.getElementById('match-count').textContent =
+    `${visible} shown · ${matching} matching`;
+}
 function redrawSort() {
   const tb = document.querySelector('#tbl tbody');
   const rows = [...tb.querySelectorAll('tr')];
   rows.sort((a, b) => {
-    let va = a.children[sortKey].innerText.trim(), vb = b.children[sortKey].innerText.trim();
+    const ca = a.children[sortKey], cb = b.children[sortKey];
+    if (ca.dataset.sortNumber != null && cb.dataset.sortNumber != null) {
+      const r = Number(ca.dataset.sortNumber) - Number(cb.dataset.sortNumber);
+      return sortAsc ? r : -r;
+    }
+    let va = ca.dataset.sort ?? ca.innerText.trim(), vb = cb.dataset.sort ?? cb.innerText.trim();
     const na = parseFloat(va.replace(/[^0-9.,-]/g, '').replace(',', '')) || null;
     const nb = parseFloat(vb.replace(/[^0-9.,-]/g, '').replace(',', '')) || null;
     let r;
@@ -1728,6 +2572,7 @@ function redrawSort() {
       ? th.dataset.label + ' <span class="ind">' + (sortAsc ? '▲' : '▼') + '</span>'
       : th.dataset.label;
   });
+  applyFilters();
 }
 function sortBy(th) {
   const k = parseInt(th.dataset.k);
@@ -1735,6 +2580,9 @@ function sortBy(th) {
   redrawSort();
 }
 function setCur(c) { cur = c; apply(); }
+document.getElementById('filter-origin').addEventListener('change', applyFilters);
+document.getElementById('filter-days-min').addEventListener('input', applyFilters);
+document.getElementById('filter-days-max').addEventListener('input', applyFilters);
 const ITINS = __ITINS__;
 function fdate(iso) {
   return new Date(iso + 'T12:00:00').toLocaleDateString('en-GB',
@@ -1784,7 +2632,9 @@ function showDetails(it) {
       : `<span class="delta-chip up">▲ ${fmt(diff).trim()} more</span>`;
   }
   const rows = [
-    ['Airfare', fmt(it.airfare)],
+    ...(it.ota_base_fare != null
+      ? [['OTA base fare', fmt(it.ota_base_fare)], ['Estimated checked bag', fmt(it.bag_estimate)]]
+      : [['Airfare', fmt(it.airfare)]]),
     ...it.transfer_items.map(([n, v]) => [esc(n), fmt(v)]),
   ];
   const costs = rows.map(([n, v]) =>
@@ -1792,10 +2642,17 @@ function showDetails(it) {
   const links = it.gf_links
     .map(([name, u]) => `<a href="${u}" target="_blank" rel="noopener">${esc(name)}</a>`)
     .join('');
+  const otaNote = !it.bag_included
+    ? `<div class="dlg-leg"><b>OTA caveat:</b> the checked-bag amount is an estimate, not a verified quote.` +
+      `${it.self_transfer ? ' This is a self-transfer itinerary.' : ''}` +
+      `${it.protected ? ' The provider marks the transfer as protected.' : ''}` +
+      `${it.fetched_at ? ' Fetched ' + esc(it.fetched_at.replace('T', ' ').replace('Z', ' UTC')) + '.' : ''}</div>`
+    : '';
   document.getElementById('dlg-body').innerHTML = `
     <div class="dlg-dates">${fdate(it.d1)} → ${fdate(it.d2)} · ${it.days} days · price per person</div>
     ${legHtml(it.out, 'Outbound')}
     ${legHtml(it.ret, 'Return', it.ret_unavailable)}
+    ${otaNote}
     <table class="dlg-costs">
       ${costs}
       <tr class="grand"><td>Total per person</td><td class="grand">${fmt(it.total)}</td></tr>
@@ -1842,12 +2699,8 @@ def label_itins(itins):
 
 
 def refresh_html(cfg, conn, args, run_ts, progress):
-    rows = load_rows(conn)
-    ss_rows = conn.execute(
-        "SELECT origin, dest, d1, d2, total_results, deals_json FROM skyscanner_prices"
-        " ORDER BY fetched_at DESC"
-    ).fetchall()
-    itins = build_itineraries(cfg, rows, ss_rows)
+    rows = load_rows(conn, cfg)
+    itins = build_with_optional_skyscanner(cfg, conn, rows)
     label_itins(itins)
     prev, prev_ts = prev_totals(conn)
     html_doc = render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress)
@@ -1866,16 +2719,16 @@ def main():
     run_ts = now_iso()
 
     progress = run_scan(cfg, conn, args, run_ts)
-    rows = load_rows(conn)
+    rows = load_rows(conn, cfg)
     itins = build_itineraries(cfg, rows)
     label_itins(itins)
-    run_skyscanner_if_due(cfg, conn, args, itins)
-    ss_rows = conn.execute(
-        "SELECT origin, dest, d1, d2, total_results, deals_json FROM skyscanner_prices"
-        " ORDER BY fetched_at DESC"
-    ).fetchall()
-    rows = load_rows(conn)
-    itins = build_itineraries(cfg, rows, ss_rows)
+    try:
+        run_skyscanner_if_due(cfg, conn, args, itins)
+    except Exception:
+        conn.rollback()
+        log.exception("skyscanner post-processing failed; continuing with Google")
+    rows = load_rows(conn, cfg)
+    itins = build_with_optional_skyscanner(cfg, conn, rows)
     label_itins(itins)
     prev, prev_ts = prev_totals(conn)
     log.info(
@@ -1884,29 +2737,41 @@ def main():
         prev_ts or "none",
     )
 
-    for it in itins[: cfg["scan"]["top_n"]]:
+    if not args.rank_only:
+        retention_cutoff = (
+            datetime.now(timezone.utc)
+            - timedelta(days=cfg.get("history", {}).get("retention_days", 180))
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
         conn.execute(
-            "INSERT INTO itinerary_history (run_ts, itin_key, kind, label, airfare, transfers, total)"
-            " VALUES (?,?,?,?,?,?,?)",
-            (
-                run_ts,
-                it["key"],
-                it["kind"],
-                it["label"],
-                it["airfare"],
-                it["transfers"],
-                it["total"],
-            ),
+            "DELETE FROM price_history WHERE fetched_at<?", (retention_cutoff,)
         )
-    conn.execute(
-        "INSERT INTO runs (run_ts, fetched, cached, failed, note) VALUES (?,?,?,?,?)",
-        (run_ts, progress["n"], progress["cached"], progress["fail"], ""),
-    )
-    conn.commit()
-    log.info(
-        "recorded %d itinerary snapshots + run stats",
-        min(len(itins), cfg["scan"]["top_n"]),
-    )
+        conn.execute(
+            "DELETE FROM itinerary_history WHERE run_ts<?", (retention_cutoff,)
+        )
+        conn.execute("DELETE FROM runs WHERE run_ts<?", (retention_cutoff,))
+        for it in itins[: cfg["scan"]["top_n"]]:
+            conn.execute(
+                "INSERT INTO itinerary_history (run_ts, itin_key, kind, label, airfare, transfers, total)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (
+                    run_ts,
+                    it["key"],
+                    it["kind"],
+                    it["label"],
+                    it["airfare"],
+                    it["transfers"],
+                    it["total"],
+                ),
+            )
+        conn.execute(
+            "INSERT INTO runs (run_ts, fetched, cached, failed, note) VALUES (?,?,?,?,?)",
+            (run_ts, progress["n"], progress["cached"], progress["fail"], ""),
+        )
+        conn.commit()
+        log.info(
+            "recorded %d itinerary snapshots + run stats",
+            min(len(itins), cfg["scan"]["top_n"]),
+        )
 
     html_doc = render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress)
     Path(args.out).write_text(html_doc, encoding="utf-8")

@@ -27,8 +27,13 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Verify code
+        run: |
+          python -m ruff check flight_search.py test_flight_search.py
+          python -m unittest -v
+
       - name: Fetch camoufox browser
-        run: python -m camoufox fetch 2>&1 | tail -1
+        run: python -m camoufox fetch
 
       - name: Scan next batch of stale queries
         run: python flight_search.py --limit 450 --db flights.db --out results.html
@@ -40,8 +45,8 @@ jobs:
           git add results.html flights.db
           git diff --cached --quiet || git commit -m "scan: refresh results and cache"
           if ! git pull --rebase origin main; then
-            echo "::warning::rebase conflict on data files - keeping remote state, this run's rows will be refetched next scan"
+            echo "::error::rebase conflict on CI-owned data files; refusing to silently discard this scan"
             git rebase --abort 2>/dev/null || true
-            git reset --hard origin/main
+            exit 1
           fi
           git push
