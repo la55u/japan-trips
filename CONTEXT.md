@@ -246,8 +246,13 @@ overall per run.
 
 Hourly at :23 (off-peak — top-of-hour crons get skipped by GitHub's scheduler; observed
 overnight blackout with `0 * * * *`). Steps: checkout@v7 → setup-python@v7 (3.14) →
-pip install → Ruff + unittest → `python -m camoufox fetch` → `python flight_search.py
---limit 450 --db flights.db --out results.html` → commit `results.html` + `flights.db`
+pip install → Ruff + unittest → `python -m camoufox fetch` → wait-for-idle
+(polls `gh run list` up to 40 min for other in-progress scan runs with startup
+jitter; GitHub's `concurrency: scan` group once failed to serialize a
+watchdog-dispatch + cron overlap and the loser died on a binary `flights.db`
+rebase conflict at the commit step, so this polls as defense in depth) →
+`python flight_search.py --limit 450 --db flights.db --out results.html` → commit
+`results.html` + `flights.db`
 as github-actions[bot] with pull --rebase; conflicts fail visibly rather than silently
 discarding a completed scan → push (Pages redeploys automatically).
 Concurrency group `scan` (serial). timeout-minutes 60. Rate config: TTL 4h, 450/run
