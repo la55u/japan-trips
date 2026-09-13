@@ -41,7 +41,7 @@ jobs:
           RUN_ID: ${{ github.run_id }}
         run: |
           sleep $((RANDOM % 30))
-          for i in $(seq 1 40); do
+          for i in $(seq 1 10); do
             active=$(gh run list --workflow scan.yml --status in_progress \
               --json databaseId \
               --jq "[.[] | select(.databaseId != $RUN_ID)] | length")
@@ -49,10 +49,11 @@ jobs:
               echo "no other scan run in progress"
               exit 0
             fi
-            echo "another scan run is in progress; waiting (${i}/40)"
+            echo "another scan run is in progress; waiting (${i}/10)"
             sleep 60
           done
-          echo "::warning::still overlapping after 40 minutes - continuing anyway"
+          echo "::error::another scan run still in progress after 10 minutes - aborting to avoid a flights.db rebase conflict"
+          exit 1
 
       - name: Scan next batch of stale queries
         run: python flight_search.py --limit 450 --db flights.db --out results.html
