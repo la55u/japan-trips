@@ -35,6 +35,25 @@ jobs:
       - name: Fetch camoufox browser
         run: python -m camoufox fetch
 
+      - name: Wait for other scan runs to finish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          sleep $((RANDOM % 30))
+          for i in $(seq 1 40); do
+            active=$(gh run list --workflow scan.yml --status in_progress \
+              --json databaseId \
+              --jq "[.[] | select(.databaseId != $RUN_ID)] | length")
+            if [ "$active" = "0" ]; then
+              echo "no other scan run in progress"
+              exit 0
+            fi
+            echo "another scan run is in progress; waiting (${i}/40)"
+            sleep 60
+          done
+          echo "::warning::still overlapping after 40 minutes - continuing anyway"
+
       - name: Scan next batch of stale queries
         run: python flight_search.py --limit 450 --db flights.db --out results.html
 
