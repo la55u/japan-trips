@@ -2259,7 +2259,8 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
             )
         if it["kind"] == "SS":
             airfare_cell = (
-                f'<td class="num" data-sort-number="{it["airfare"]:.2f}">'
+                f'<td class="num" data-sort-number="{it["airfare"]:.2f}"'
+                f' data-base-fare="{it.get("ota_base_fare") or 0:.2f}">'
                 f'<span data-eur="{it["airfare"]:.0f}">{it["airfare"]:.0f}</span><br>'
                 f'<small title="raw OTA fare plus a conservative checked-bag estimate per person">'
                 f'<span data-eur="{it.get("ota_base_fare") or 0:.0f}">{it.get("ota_base_fare") or 0:.0f}</span>'
@@ -2270,6 +2271,7 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
         rows_html.append(
             f'<tr data-eur-total="{it["total"]:.2f}" data-origin="{html.escape(it["out_origin"])}" '
             f'data-days="{trip_days}" data-kind="{it["kind"]}" data-i="{idx}" title="click for details"'
+            f' data-bag="{it.get("bag_estimate") or 0:.2f}"'
             f' data-out-dur="{o.get("dur_h", "") if isinstance(o, dict) else ""}"'
             f' data-ret-dur="{r.get("dur_h", "") if isinstance(r, dict) else ""}">'
             f'<td class="rank">{i}</td><td><span class="{badge_cls}">{kind_label}</span>{agent_html}</td><td>{route_txt}</td>'
@@ -2280,7 +2282,7 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
             f"{leg_cell(r, unavailable=it.get('ret_unavailable', False))}"
             f"{airfare_cell}"
             f'<td class="num" data-eur="{it["transfers"]:.0f}" data-sort-number="{it["transfers"]:.2f}" title="{html.escape(tr_items)}">{it["transfers"]:.0f}</td>'
-            f'<td class="num total" data-eur="{it["total"]:.0f}" data-sort-number="{it["total"]:.2f}">{it["total"]:.0f}</td>'
+            f'<td class="num total" data-eur="{it["total"]:.0f}" data-sort-number="{it["total"]:.2f}" data-transfers="{it["transfers"]:.2f}">{it["total"]:.0f}</td>'
             f'<td class="num">{delta}</td><td>{links}</td></tr>'
         )
         shown_json.append(
@@ -2563,10 +2565,12 @@ TEMPLATE = """<!doctype html>
  .filters { display: flex; align-items: end; flex-wrap: wrap; gap: 8px; }
  .filter { display: grid; gap: 3px; color: var(--muted); font-size: .68rem;
            letter-spacing: .03em; text-transform: uppercase; }
- .filter select, .filter input { height: 32px; border: 1px solid var(--line);
-           border-radius: 8px; background: var(--card); color: var(--text);
-           padding: 4px 9px; font: inherit; font-size: .8rem; letter-spacing: 0;
-           text-transform: none; }
+  .filter select, .filter input { height: 32px; border: 1px solid var(--line);
+            border-radius: 8px; background: var(--card); color: var(--text);
+            padding: 4px 9px; font: inherit; font-size: .8rem; letter-spacing: 0;
+            text-transform: none; }
+  .filter.check input { height: 16px; width: 16px; padding: 0; accent-color: var(--accent); }
+  .filter.check { align-self: end; padding-bottom: 8px; }
  .day-range { display: flex; align-items: center; gap: 5px; }
  .day-range input { width: 62px; }
  .match-count { color: var(--muted); font-size: .76rem; padding-bottom: 6px; }
@@ -2698,6 +2702,9 @@ TEMPLATE = """<!doctype html>
     <label class="filter">Max leg h
      <input id="filter-leg-max" type="number" min="1" step="1" value="__MAX_LEG_FILTER__" aria-label="Maximum single-leg duration in hours">
     </label>
+    <label class="filter check">Bag fees
+     <input id="filter-bags" type="checkbox" checked aria-label="Include estimated bag fees for OTA fares">
+    </label>
     <label class="filter">Trip days
     <span class="day-range">
      <input id="filter-days-min" type="number" min="__MIN_DAYS__" max="__MAX_DAYS__" value="__MIN_DAYS__" aria-label="Minimum trip days">
@@ -2731,6 +2738,8 @@ __ROWS__
   last checked more than a day ago — re-verify via the Skyscanner link before booking.
   The <i>Max leg h</i> filter (default 24) hides rows where any single leg is longer —
   raise it to uncover cheaper but slower OTA itineraries (durations turn red above 24h).
+  Untick <i>Bag fees</i> to compare OTA fares without the estimated checked-bag cost —
+  summary cards and Google rows always include everything.
  Open jaw = sum of two one-ways (verify the true multi-city price via the GF links).
  Times are local; (+n) = arrival n days after departure; duration includes layovers.
  For round trips the return leg is the actual flight paired with the shown outbound when
@@ -2835,6 +2844,26 @@ function sortBy(th) {
   redrawSort();
 }
 function setCur(c) { cur = c; apply(); }
+let includeBags = true;
+function setBags(include) {
+  includeBags = include;
+  document.querySelectorAll('#tbl tbody tr[data-kind="SS"]').forEach(tr => {
+    const bag = parseFloat(tr.dataset.bag || '0') || 0;
+    const fareTd = tr.children[8], totalTd = tr.children[10];
+    const base = parseFloat(fareTd.dataset.baseFare || '0') || 0;
+    const transfers = parseFloat(totalTd.dataset.transfers || '0') || 0;
+    const air = include ? base + bag : base;
+    const total = base + (include ? bag : 0) + transfers;
+    const span = fareTd.querySelector('span[data-eur]');
+    if (span) span.dataset.eur = air.toFixed(0);
+    fareTd.dataset.sortNumber = air.toFixed(2);
+    tr.dataset.eurTotal = total.toFixed(2);
+    totalTd.dataset.eur = total.toFixed(0);
+    totalTd.dataset.sortNumber = total.toFixed(2);
+  });
+  apply();
+}
+document.getElementById('filter-bags').addEventListener('change', e => setBags(e.target.checked));
 document.getElementById('filter-origin').addEventListener('change', applyFilters);
 document.getElementById('filter-source').addEventListener('change', applyFilters);
 document.getElementById('filter-days-min').addEventListener('input', applyFilters);
@@ -2888,12 +2917,16 @@ function showDetails(it) {
       ? `<span class="delta-chip down">▼ ${fmt(Math.abs(diff)).trim()} cheaper</span>`
       : `<span class="delta-chip up">▲ ${fmt(diff).trim()} more</span>`;
   }
+  const bagOff = !includeBags && it.bag_estimate != null && !it.bag_included;
   const rows = [
     ...(it.ota_base_fare != null
-      ? [['OTA base fare', fmt(it.ota_base_fare)], ['Estimated checked bag', fmt(it.bag_estimate)]]
+      ? (bagOff
+          ? [['OTA base fare (bag fees excluded)', fmt(it.ota_base_fare)]]
+          : [['OTA base fare', fmt(it.ota_base_fare)], ['Estimated checked bag', fmt(it.bag_estimate)]])
       : [['Airfare', fmt(it.airfare)]]),
     ...it.transfer_items.map(([n, v]) => [esc(n), fmt(v)]),
   ];
+  const grand = bagOff ? it.total - it.bag_estimate : it.total;
   const costs = rows.map(([n, v]) =>
     `<tr><td>${n}</td><td>${v}</td></tr>`).join('');
   const links = it.gf_links
@@ -2914,7 +2947,7 @@ function showDetails(it) {
     ${otaNote}
     <table class="dlg-costs">
       ${costs}
-      <tr class="grand"><td>Total per person</td><td class="grand">${fmt(it.total)}</td></tr>
+      <tr class="grand"><td>Total per person</td><td class="grand">${fmt(grand)}</td></tr>
     </table>
     <div>${delta}</div>
     <div class="dlg-links">${links}</div>`;

@@ -242,9 +242,14 @@ coverage (checked/total pairs, stored rows, oldest check, full-sweep estimate).
 Client-side filters: departure city, source (All / Google RT+OJ / OTA Skyscanner),
 max leg hours (default `[ranking].max_leg_filter_hours` = 24; hides rows whose
 outbound OR return leg duration exceeds it — raise it to surface the cheap
-long-leg OTA rows stored up to `max_leg_hours_display`), and a min/max trip-day
+long-leg OTA rows stored up to `max_leg_hours_display`), a Bag fees checkbox
+(default on; unticking rewrites SS rows' airfare/total to the raw OTA fare via
+`data-base-fare`/`data-bag`/`data-transfers` and re-sorts — cards and Google rows
+are unaffected, and the detail dialog follows the toggle), and a min/max trip-day
 range. Rows carry `data-out-dur`/`data-ret-dur` for the filter; legs without a
-known duration always pass. Rendering keeps the top `top_n` rows per
+known duration always pass. Summary cards are computed from the UNFILTERED
+ranking (they can disagree with the first visible row when filters hide rows).
+Rendering keeps the top `top_n` rows per
 `(departure city, trip days)` bucket, then the browser displays at most `top_n`
 matching rows under the active filters and sort order.
 Summary cards: cheapest overall / round trip / open jaw / OTA (Skyscanner).

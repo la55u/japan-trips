@@ -965,8 +965,11 @@ class RenderTests(unittest.TestCase):
         self.assertIn("Cheapest OTA (Skyscanner)", rendered)
         self.assertIn('id="filter-leg-max"', rendered)
         self.assertIn('value="24"', rendered)
+        self.assertIn('id="filter-bags"', rendered)
         self.assertRegex(rendered, r'data-out-dur="20\.0"')
         self.assertRegex(rendered, r'data-ret-dur="20\.0"')
+        self.assertRegex(rendered, r'data-bag="30\.00"')
+        self.assertRegex(rendered, r'data-base-fare="300\.00"')
         self.assertIn(
             '<span data-eur="300">300</span> fare + <span data-eur="30">30</span> bags',
             rendered,
