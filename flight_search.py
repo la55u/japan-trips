@@ -2201,12 +2201,12 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
             "SS": "Round trip · OTA",
         }[it["kind"]]
         route_txt = f"{it['out_origin']} → {it['in_city']} · {it['out_city']} → {it['ret_dest']}"
-        delta = ""
+        delta_html = ""
         if it["key"] in prev and prev[it["key"]] != it["total"]:
             diff = it["total"] - prev[it["key"]]
             cls = "down" if diff < 0 else "up"
             arrow = "▼" if diff < 0 else "▲"
-            delta = f'<span class="{cls}">{arrow} {abs(diff):.0f}</span>'
+            delta_html = f' <span class="{cls}" title="vs previous run">{arrow} {abs(diff):.0f}</span>'
         gf_links = []
         q1 = build_query(
             "OW" if it["kind"] == "OJ" else "RT",
@@ -2282,8 +2282,8 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
             f"{leg_cell(r, unavailable=it.get('ret_unavailable', False))}"
             f"{airfare_cell}"
             f'<td class="num" data-eur="{it["transfers"]:.0f}" data-sort-number="{it["transfers"]:.2f}" title="{html.escape(tr_items)}">{it["transfers"]:.0f}</td>'
-            f'<td class="num total" data-eur="{it["total"]:.0f}" data-sort-number="{it["total"]:.2f}" data-transfers="{it["transfers"]:.2f}">{it["total"]:.0f}</td>'
-            f'<td class="num">{delta}</td><td>{links}</td></tr>'
+            f'<td class="num total" data-sort-number="{it["total"]:.2f}" data-transfers="{it["transfers"]:.2f}"><span data-eur="{it["total"]:.0f}">{it["total"]:.0f}</span>{delta_html}</td>'
+            f"<td>{links}</td></tr>"
         )
         shown_json.append(
             {
@@ -2481,11 +2481,36 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
         )
     stats_html = ""
     for value, label, sub in stat_items:
-        sub_html = f"<small>{html.escape(sub)}</small>" if sub else ""
+        sub_html = f"<small>{html.escape(str(sub))}</small>" if sub else ""
         stats_html += (
-            f'<span class="stat" title="{html.escape(label)}">'
-            f"<b>{value}</b> {html.escape(label)} {sub_html}</span>"
+            f'<div class="srow"><span class="slabel">{html.escape(label)}</span>'
+            f'<span class="sval">{html.escape(str(value))}{sub_html}</span></div>'
         )
+
+    # cheapest deal per route over runs (from itinerary_history keys)
+    route_best = {}
+    for ts, k, total in hist_rows:
+        parts = k.split("|")
+        if len(parts) >= 3 and parts[0] in ("RT", "OJ", "SS"):
+            route = f"{parts[1]}→{parts[2]}"
+            per_run = route_best.setdefault(ts, {})
+            if route not in per_run or total < per_run[route]:
+                per_run[route] = total
+    route_names = sorted({r for d in route_best.values() for r in d})
+    route_datasets = []
+    for idx, route in enumerate(route_names):
+        route_datasets.append(
+            {
+                "label": route,
+                "data": [route_best.get(ts, {}).get(route) for ts in all_run_ts],
+                "borderColor": palette[idx % len(palette)],
+                "backgroundColor": palette[idx % len(palette)],
+                "spanGaps": True,
+                "tension": 0.25,
+                "pointRadius": 2,
+            }
+        )
+    route_chart = {"labels": chart_labels, "datasets": route_datasets}
 
     html_doc = TEMPLATE
     html_doc = html_doc.replace("__RUN_TS__", run_ts)
@@ -2519,6 +2544,8 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
     def script_json(value):
         return json.dumps(value, ensure_ascii=False).replace("<", "\\u003c")
 
+    html_doc = html_doc.replace("__ROUTE_CHART__", script_json(route_chart))
+
     html_doc = html_doc.replace("__ITINS__", script_json(shown_json))
     html_doc = html_doc.replace("__CHART_DATA__", script_json(chart_data))
     html_doc = html_doc.replace("__BEST_CHART__", script_json(best_chart))
@@ -2542,140 +2569,7 @@ TEMPLATE = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>BUD/VIE -&gt; Japan flight deals</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
-<style>
- :root {
-   --bg: #f5f6f8; --card: #ffffff; --line: #e6e8ec; --line-soft: #eef0f3;
-   --text: #191d24; --muted: #69707a; --accent: #2456c8; --accent-soft: #eef3fd;
-   --good: #17803d; --good-soft: #e8f5ec; --bad: #b42318; --bad-soft: #fdeceb;
- }
- * { box-sizing: border-box; }
- body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; margin: 0;
-        background: var(--bg); color: var(--text); line-height: 1.45; }
- .wrap { max-width: 1280px; margin: 0 auto; padding: 22px 18px 44px; }
- .top { padding: 2px 0 4px; }
- h1 { font-size: 1.3rem; margin: 0 0 2px; letter-spacing: -0.01em; }
- .meta { color: var(--muted); font-size: .82rem; }
- .toolbar { display: flex; align-items: center; justify-content: space-between;
-            flex-wrap: wrap; gap: 10px; margin: 16px 0 12px; }
- .seg { display: inline-flex; background: var(--card); border: 1px solid var(--line);
-        border-radius: 999px; padding: 3px; }
- .seg button { border: none; background: transparent; padding: 5px 16px;
-               border-radius: 999px; cursor: pointer; font-size: .85rem; color: var(--muted); }
- .seg button.active { background: var(--text); color: #fff; }
- .filters { display: flex; align-items: end; flex-wrap: wrap; gap: 8px; }
- .filter { display: grid; gap: 3px; color: var(--muted); font-size: .68rem;
-           letter-spacing: .03em; text-transform: uppercase; }
-  .filter select, .filter input { height: 32px; border: 1px solid var(--line);
-            border-radius: 8px; background: var(--card); color: var(--text);
-            padding: 4px 9px; font: inherit; font-size: .8rem; letter-spacing: 0;
-            text-transform: none; }
-  .filter.check input { height: 16px; width: 16px; padding: 0; accent-color: var(--accent); }
-  .filter.check { align-self: end; padding-bottom: 8px; }
- .day-range { display: flex; align-items: center; gap: 5px; }
- .day-range input { width: 62px; }
- .match-count { color: var(--muted); font-size: .76rem; padding-bottom: 6px; }
- .stats { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 14px; }
- .stat { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
-         padding: 6px 12px; font-size: .78rem; color: var(--muted); }
- .stat b { color: var(--text); font-weight: 650; font-variant-numeric: tabular-nums; }
- .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-          gap: 12px; margin-bottom: 14px; }
- .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px;
-         padding: 13px 18px; }
- .card.best { border-color: var(--accent); background: linear-gradient(0deg, var(--accent-soft), var(--card) 70%); }
- .card-label { font-size: .7rem; letter-spacing: .07em; text-transform: uppercase;
-               color: var(--muted); font-weight: 600; }
- .card-value { font-size: 1.65rem; font-weight: 700; margin: 2px 0;
-               font-variant-numeric: tabular-nums; }
- .card-value .cur { font-size: 1rem; font-weight: 600; color: var(--muted); }
- .card-sub { font-size: .8rem; color: var(--muted); }
- .panel { background: var(--card); border: 1px solid var(--line); border-radius: 14px; }
- .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; border-radius: 14px; }
- table { border-collapse: collapse; font-size: .85rem; width: 100%; }
- thead th { position: sticky; top: 0; z-index: 2; background: var(--card);
-            border-bottom: 2px solid var(--line); padding: 10px;
-            font-size: .68rem; letter-spacing: .05em; text-transform: uppercase;
-            color: var(--muted); text-align: left; cursor: pointer; user-select: none;
-            white-space: nowrap; }
- tbody td { padding: 9px 10px; border-bottom: 1px solid var(--line-soft);
-            vertical-align: top; }
- tbody tr:last-child td { border-bottom: none; }
- tbody tr { cursor: pointer; }
- tbody tr:hover { background: var(--accent-soft); }
- .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
- td.total { font-weight: 700; color: var(--accent); font-size: .95rem; }
- .rank { color: var(--muted); }
- td small, .dlg small { color: var(--muted); }
- .badge { display: inline-block; font-size: .68rem; font-weight: 600; padding: 2px 9px;
-          border-radius: 999px; white-space: nowrap; background: var(--accent-soft);
-          color: var(--accent); }
- .badge.oj { background: #fdf1e3; color: #a15c07; }
- .down { color: var(--good); font-weight: 600; }
- .up { color: var(--bad); font-weight: 600; }
- .dur-ok { color: var(--good); font-weight: 600; }
- .dur-mid { color: #b45309; font-weight: 600; }
- .dur-bad { color: var(--bad); font-weight: 600; }
- .ind { color: var(--accent); font-size: .68rem; }
- .gf { font-size: .75rem; text-decoration: none; margin-right: 6px; white-space: nowrap; }
- .gf:hover { text-decoration: underline; }
- .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
-           gap: 12px; margin-top: 14px; }
- .chart-box { background: var(--card); border: 1px solid var(--line);
-              border-radius: 14px; padding: 14px; }
- .chart-box h3 { margin: 0 0 10px; font-size: .88rem; font-weight: 600; }
- .foot { color: var(--muted); font-size: .78rem; margin-top: 16px; max-width: 920px; }
- dialog { border: none; border-radius: 16px; padding: 0; width: min(560px, 94vw);
-          max-height: 86vh; box-shadow: 0 24px 60px rgba(10, 15, 30, .35); }
- dialog::backdrop { background: rgba(15, 20, 30, .5); backdrop-filter: blur(2px); }
- .dlg-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
-             background: var(--text); color: #fff; padding: 14px 18px;
-             border-radius: 16px 16px 0 0; }
- .dlg-head h2 { margin: 0; font-size: 1rem; font-weight: 650; line-height: 1.3; }
- .dlg-close { background: none; border: none; color: #fff; font-size: 1.3rem; line-height: 1;
-              cursor: pointer; padding: 3px 8px; border-radius: 8px; flex-shrink: 0; }
- .dlg-close:hover { background: rgba(255,255,255,.15); }
- .dlg-body { padding: 16px 18px 18px; overflow-y: auto; font-size: .9rem; }
- .dlg-dates { color: var(--muted); margin-bottom: 12px; font-size: .85rem; }
- .dlg-leg { background: #f8f9fb; border: 1px solid var(--line-soft); border-radius: 10px;
-            padding: 11px 13px; margin-bottom: 10px; }
- .dlg-leg h3 { margin: 0 0 5px; font-size: .72rem; letter-spacing: .06em;
-               text-transform: uppercase; color: var(--accent); }
- .dlg-leg .route { font-size: 1.02rem; font-weight: 650; }
- .dlg-leg .airports { color: var(--muted); font-size: .78rem; margin: 3px 0 5px; }
- .dlg-leg .fetched { color: var(--muted); font-size: .74rem; margin-top: 5px; }
- .dlg-costs { width: 100%; border-collapse: collapse; margin: 6px 0 2px; }
- .dlg-costs td { border: none; border-top: 1px solid var(--line-soft); padding: 6px 4px; }
- .dlg-costs td:last-child { text-align: right; white-space: nowrap;
-                            font-variant-numeric: tabular-nums; }
- .dlg-costs .grand { font-weight: 700; font-size: 1.08rem; color: var(--accent); }
- .dlg-links { margin-top: 12px; }
- .dlg-links a { display: inline-block; margin: 0 8px 6px 0; padding: 6px 14px;
-                border: 1px solid var(--accent); border-radius: 8px;
-                text-decoration: none; font-size: .83rem; color: var(--accent); }
- .dlg-links a:hover { background: var(--accent); color: #fff; }
- .delta-chip { display: inline-block; padding: 2px 9px; border-radius: 999px;
-               font-size: .78rem; font-weight: 600; }
- .delta-chip.down { background: var(--good-soft); color: var(--good); }
- .delta-chip.up { background: var(--bad-soft); color: var(--bad); }
- .muted { color: var(--muted); }
- @media (max-width: 720px) {
-   .wrap { padding: 14px 10px 32px; }
-   h1 { font-size: 1.05rem; }
-   .meta { font-size: .75rem; }
-   .cards { grid-template-columns: 1fr; gap: 8px; }
-   .card { padding: 10px 14px; }
-   .card-value { font-size: 1.3rem; }
-   .toolbar { align-items: flex-start; }
-   .filters { width: 100%; }
-   .filter:first-child { flex: 1; }
-   .filter select { width: 100%; }
-   table { font-size: .72rem; }
-   thead th { padding: 8px 6px; }
-   tbody td { padding: 7px 6px; }
-   .chart-box { padding: 10px; }
-   .dlg-body { padding: 12px 14px 14px; }
- }
-</style>
+<link rel="stylesheet" href="results.css">
 </head>
 <body>
 <div class="wrap">
@@ -2683,6 +2577,7 @@ TEMPLATE = """<!doctype html>
   <h1>BUD/VIE &harr; Tokyo/Osaka deals &mdash; 12&ndash;16 days, <span id="window">__WINDOW__</span></h1>
   <div class="meta">__META__</div>
  </div>
+ <div class="cards">__CARDS__</div>
  <div class="toolbar">
   <div class="seg">
    <button id="btn-eur" class="active" onclick="setCur('EUR')">EUR</button>
@@ -2706,15 +2601,14 @@ TEMPLATE = """<!doctype html>
      <input id="filter-bags" type="checkbox" checked aria-label="Include estimated bag fees for OTA fares">
     </label>
     <label class="filter">Trip days
-    <span class="day-range">
-     <input id="filter-days-min" type="number" min="__MIN_DAYS__" max="__MAX_DAYS__" value="__MIN_DAYS__" aria-label="Minimum trip days">
-     <span>to</span>
-     <input id="filter-days-max" type="number" min="__MIN_DAYS__" max="__MAX_DAYS__" value="__MAX_DAYS__" aria-label="Maximum trip days">
-    </span>
-   </label>
-   <span class="match-count" id="match-count" aria-live="polite"></span>
+     <span class="day-range">
+      <input id="filter-days-min" type="number" min="__MIN_DAYS__" max="__MAX_DAYS__" value="__MIN_DAYS__" aria-label="Minimum trip days">
+      <span>to</span>
+      <input id="filter-days-max" type="number" min="__MIN_DAYS__" max="__MAX_DAYS__" value="__MAX_DAYS__" aria-label="Maximum trip days">
+     </span>
+    </label>
+   </div>
   </div>
- </div>
   <div class="panel table-wrap">
   <table id="tbl">
   <thead><tr>
@@ -2722,16 +2616,23 @@ TEMPLATE = """<!doctype html>
    <th data-k="3">Outbound</th><th data-k="4">Return</th><th data-k="5" class="num">Days</th>
    <th data-k="6">Outbound leg</th><th data-k="7">Return leg</th>
    <th data-k="8" class="num">Airfare</th><th data-k="9" class="num">Transfers</th><th data-k="10" class="num">Total</th>
-   <th data-k="11" class="num">&Delta;</th><th>Links</th>
+   <th>Links</th>
   </tr></thead>
   <tbody>
 __ROWS__
 </tbody>
   </table>
   </div>
-  <div class="cards">__CARDS__</div>
-  <div class="stats">__STATS__</div>
-<p class="foot">Prices per person from __ADULTS__-adult queries, max __MAX_STOPS__ stops.
+  <div class="insights">
+   <div class="panel stats-panel">
+    <h3>Scan status</h3>
+    <div class="stat-grid">__STATS__</div>
+   </div>
+   <div class="chart-box"><h3>Cheapest per route &mdash; over runs</h3><canvas id="c3"></canvas></div>
+  </div>
+  <details class="foot-details">
+   <summary>About the data &amp; how to read the table</summary>
+   <p class="foot">Prices per person from __ADULTS__-adult queries, max __MAX_STOPS__ stops.
   Google fares request one checked bag. Skyscanner/OTA fares are ranked independently of
   Google: the airfare column shows the raw OTA fare plus a conservative configured
   checked-bag estimate (hover for the breakdown). Rows marked <i>indicative</i> were
@@ -2740,19 +2641,20 @@ __ROWS__
   raise it to uncover cheaper but slower OTA itineraries (durations turn red above 24h).
   Untick <i>Bag fees</i> to compare OTA fares without the estimated checked-bag cost —
   summary cards and Google rows always include everything.
- Open jaw = sum of two one-ways (verify the true multi-city price via the GF links).
- Times are local; (+n) = arrival n days after departure; duration includes layovers.
- For round trips the return leg is the actual flight paired with the shown outbound when
- available (fetched via Google's selection API), otherwise a <i>reference</i> (the best
- one-way on the same date, marked &asymp;) &mdash; verify via the GF links.
- Transfers are config estimates, added per person: open jaw = shinkansen;
- round trip = shinkansen + domestic flight; FlixBus per Vienna leg
- (shinkansen €90, domestic flight €65, FlixBus €15/direction). &Delta; vs previous run. Airport codes carry full names
- on hover &mdash; or click any row for a detail card.</p>
- <div class="charts">
-  <div class="chart-box"><h3>Top itineraries &mdash; total price over runs</h3><canvas id="c1"></canvas></div>
-  <div class="chart-box"><h3>Cheapest overall over runs</h3><canvas id="c2"></canvas></div>
- </div>
+  Open jaw = sum of two one-ways (verify the true multi-city price via the GF links).
+  Times are local; (+n) = arrival n days after departure; duration includes layovers.
+  For round trips the return leg is the actual flight paired with the shown outbound when
+  available (fetched via Google's selection API), otherwise a <i>reference</i> (the best
+  one-way on the same date, marked &asymp;) &mdash; verify via the GF links.
+  Transfers are config estimates, added per person: open jaw = shinkansen;
+  round trip = shinkansen + domestic flight; FlixBus per Vienna leg
+  (shinkansen €90, domestic flight €65, FlixBus €15/direction). &Delta; vs previous run. Airport codes carry full names
+  on hover &mdash; or click any row for a detail card.</p>
+  </details>
+  <div class="charts">
+   <div class="chart-box"><h3>Top itineraries &mdash; total price over runs</h3><canvas id="c1"></canvas></div>
+   <div class="chart-box"><h3>Cheapest overall over runs</h3><canvas id="c2"></canvas></div>
+  </div>
 </div>
 <dialog id="dlg">
  <div class="dlg-head">
@@ -2811,8 +2713,6 @@ function applyFilters() {
       row.querySelector('.rank').textContent = visible;
     }
   });
-  document.getElementById('match-count').textContent =
-    `${visible} shown · ${matching} matching`;
 }
 function redrawSort() {
   const tb = document.querySelector('#tbl tbody');
@@ -2964,6 +2864,12 @@ document.querySelectorAll('#tbl tbody tr').forEach(tr => {
 dlg.addEventListener('click', e => { if (e.target === dlg) dlg.close(); });
 const chartData = __CHART_DATA__;
 const bestChart = __BEST_CHART__;
+const routeChart = __ROUTE_CHART__;
+new Chart(document.getElementById('c3'), {
+  type: 'line', data: routeChart,
+  options: { scales: { y: { title: { display: true, text: 'EUR/person' } } },
+             plugins: { legend: { position: 'bottom', labels: { boxWidth: 12, font: { size: 10 } } } } }
+});
 new Chart(document.getElementById('c1'), {
   type: 'line', data: chartData,
   options: { scales: { y: { title: { display: true, text: 'EUR/person' } } },

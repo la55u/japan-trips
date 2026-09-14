@@ -80,7 +80,9 @@ push promptly (the DB is a binary file and cannot merge).
 
 ## Output (`results.html`)
 
-- Summary cards (below the table): cheapest overall / round trip / open jaw / OTA
+- Files: `results.html` (generated) + `results.css` (static styles, committed) —
+  the only HTML file on the site.
+- Summary cards (top of page, compact): cheapest overall / round trip / open jaw / OTA
   (Skyscanner).
 - Filters sit directly above the table: EUR/HUF toggle, departure-city selector, source
   filter (Google / OTA), max single-leg duration (default 24 h — raise it to surface
@@ -218,8 +220,9 @@ database or report.
 
 ## GitHub Pages
 
-The report is published at https://la55u.github.io/japan-trips/ (served from the
-`main` branch root; `index.html` redirects to `results.html`). The page is refreshed
+The report is published at https://la55u.github.io/japan-trips/results.html (served
+from the `main` branch root; it is the only HTML file — `results.css` carries the
+styles). The page is refreshed
 automatically by the scheduled workflow; after a deliberate local scan against the
 repo DB, push as described in "Local vs CI data":
 

@@ -863,6 +863,12 @@ class ParserTests(unittest.TestCase):
 
 
 class RenderTests(unittest.TestCase):
+    def test_stylesheet_is_external(self):
+        self.assertIn('<link rel="stylesheet" href="results.css">', fs.TEMPLATE)
+        self.assertNotIn("<style>", fs.TEMPLATE)
+        with open("results.css") as f:
+            self.assertIn(".cards", f.read())
+
     def test_table_filters_and_per_bucket_candidates_are_rendered(self):
         cfg = config()
         conn = fs.init_db(":memory:")
@@ -894,14 +900,20 @@ class RenderTests(unittest.TestCase):
         self.assertIn('data-origin="BUD" data-days="12"', rendered)
         self.assertIn('data-origin="VIE" data-days="12"', rendered)
         self.assertIn("const TABLE_LIMIT = 1;", rendered)
-        # layout: filters directly above the table, cards/stats below it
+        # layout: cards on top, then filters directly above the table,
+        # then stats section + route chart below the table
         order = [
+            rendered.index('class="cards"'),
             rendered.index('class="toolbar"'),
             rendered.index('class="panel table-wrap"'),
-            rendered.index('class="cards"'),
-            rendered.index('class="stats"'),
+            rendered.index('class="insights"'),
         ]
         self.assertEqual(order, sorted(order))
+        self.assertNotIn("match-count", rendered)
+        self.assertIn("Scan status", rendered)
+        self.assertIn('id="c3"', rendered)
+        self.assertIn("<details", rendered)
+        self.assertNotIn("data-eur-total", rendered.split("</thead>")[0])
 
     def test_ss_rows_render_source_kind_indicative_and_fare_breakdown(self):
         cfg = config()

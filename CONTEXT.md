@@ -21,7 +21,11 @@ MUST be updated whenever behavior, schema, config, or pipeline changes.**
 - `config.toml` — all knobs (window, costs, TTL, cadence, skyscanner settings).
 - `flights.db` — CI-owned SQLite (committed). Local runs use `flights_local.db`.
 - `results.html` — generated report, deployed to GitHub Pages (CI-owned).
-- `index.html` — redirect to results.html.
+- `results.css` — static stylesheet linked by results.html (must be committed;
+  local `--out` runs into another directory won't style the page).
+- GitHub Pages has no root redirect page: the canonical URL is
+  https://la55u.github.io/japan-trips/results.html (results.html is the only HTML
+  file in the repo).
 - `.github/workflows/scan.yml` — hourly scan job.
 - `requirements.txt` — pinned runtime and Ruff dependencies.
 - `README.md` — human-facing docs.
@@ -33,7 +37,7 @@ MUST be updated whenever behavior, schema, config, or pipeline changes.**
   `./venv/bin/python -m pip ...` or `./venv/bin/python script.py`).
 - The repository directory was previously renamed; do not rely on venv script shebangs.
 - GitHub: repo `la55u/japan-trips`, Pages at
-  https://la55u.github.io/japan-trips/ (branch `main`, root, `index.html` redirects).
+  https://la55u.github.io/japan-trips/results.html (branch `main`, root).
 - Local test DB `flights_local.db` was seeded from `flights.db` once; it diverges.
 
 ## Data ownership (critical invariant)
@@ -222,8 +226,10 @@ Other validation errors (e.g. ReturnValidationError) still count as failures.
 ## HTML page (results.html)
 
 Template string `TEMPLATE` in flight_search.py, placeholders `__*__` replaced in
-render_html. Page order: header → toolbar (EUR/HUF toggle + ALL filters) → ranking
-table → summary cards → stats strip → foot notes → charts. Single merged ranking
+render_html. Styles live in the static `results.css` (linked via `<link>`); the page
+order: header → compact summary cards → toolbar (EUR/HUF toggle + ALL filters) →
+ranking table → insights (Scan status panel + cheapest-per-route chart) →
+history charts → collapsible foot notes (`<details>`). Single merged ranking
 table (RT/OJ/SS mixed, sorted by total):
 columns # / Type (badge; SS rows add "via <agent>", plus a bold "indicative, checked
 Xh ago" note when stale) / Route / Outbound / Return / Days / Outbound leg / Return leg
