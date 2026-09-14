@@ -2,7 +2,7 @@ venv/
 __pycache__/
 *.pyc
 flights_local.db
-results_local.html
+index_local.html
 .env
 .env.*
 !.env.example

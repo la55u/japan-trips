@@ -6,8 +6,8 @@ Scanner for cheap flights from Budapest/Vienna to Tokyo/Osaka (12–16 day trips
 - **Source**: `flight_search.py` (single file) + `config.toml`. Google Flights via the
   unofficial API (primp + custom parser + RPC replay), Skyscanner via camoufox.
 - **Run**: `./venv/bin/python flight_search.py` (full local scan; CI runs it hourly with
-  `--db flights.db --out results.html`).
-- **Output**: `results.html` → https://la55u.github.io/japan-trips/
+  `--db flights.db --out index.html`).
+- **Output**: `index.html` → https://la55u.github.io/japan-trips/
 - **Data**: SQLite `flights.db` (CI-owned, committed) for cache + price history.
 
 ## Setup

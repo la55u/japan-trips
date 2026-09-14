@@ -51,7 +51,7 @@ python3 -m venv venv
 ## Usage
 
 ```bash
-./venv/bin/python flight_search.py              # full scan into flights_local.db + results_local.html
+./venv/bin/python flight_search.py              # full scan into flights_local.db + index_local.html
 ./venv/bin/python flight_search.py --limit 50   # partial run (first 50 stale queries)
 ./venv/bin/python flight_search.py --rank-only  # rebuild ranking + HTML from local cache
 ./venv/bin/python flight_search.py --force      # ignore cache TTL, refetch everything
@@ -67,20 +67,20 @@ overwrite each other's price history:
 
 | | DB | Report | Committed to git |
 |---|---|---|---|
-| **CI (GitHub Actions, hourly)** | `flights.db` | `results.html` → GitHub Pages | yes |
-| **Local runs (default)** | `flights_local.db` | `results_local.html` | no (gitignored) |
+| **CI (GitHub Actions, hourly)** | `flights.db` | `index.html` → GitHub Pages | yes |
+| **Local runs (default)** | `flights_local.db` | `index_local.html` | no (gitignored) |
 
-Local runs never touch `flights.db`/`results.html`, and the CI workflow explicitly
-passes `--db flights.db --out results.html`, so neither side can clobber the other.
+Local runs never touch `flights.db`/`index.html`, and the CI workflow explicitly
+passes `--db flights.db --out index.html`, so neither side can clobber the other.
 Local history and the site's history diverge — that's by design.
 
 If you deliberately want a local scan to feed the live site, opt in with
-`--db flights.db --out results.html`, then `git pull --rebase` immediately after and
+`--db flights.db --out index.html`, then `git pull --rebase` immediately after and
 push promptly (the DB is a binary file and cannot merge).
 
-## Output (`results.html`)
+## Output (`index.html`)
 
-- Files: `results.html` (generated) + `results.css` (static styles, committed) —
+- Files: `index.html` (generated) + `results.css` (static styles, committed) —
   the only HTML file on the site.
 - Summary cards (top of page, compact): cheapest overall / round trip / open jaw / OTA
   (Skyscanner).
@@ -128,7 +128,7 @@ delay or skip scheduled jobs. Each run fetches the 450 oldest stale queries
 (`--limit 450 --db flights.db`, cache TTL 4 h), targeting a full refresh in roughly
 four runs. The page reports actual freshness and deferred stale work instead of
 claiming a guaranteed four-hour age. Ruff and unit tests run before scanning. After
-scanning, the workflow commits `results.html` and `flights.db` back to `main`, and
+scanning, the workflow commits `index.html` and `flights.db` back to `main`, and
 GitHub Pages redeploys automatically. `flights.db` is committed so price history and
 deltas accumulate across runs; it is written **only by CI** (see "Local vs CI data").
 Manual runs: *Actions → scan → Run workflow*.
@@ -215,17 +215,17 @@ database or report.
 - `systemd/` — user service and 10-minute timer for the watchdog.
 - `config.toml` — all settings.
 - `flights.db` — CI-owned SQLite cache + price history (committed).
-- `results.html` — generated report deployed via GitHub Pages.
-- `flights_local.db`, `results_local.html` — local-run outputs (gitignored).
+- `index.html` — generated report deployed via GitHub Pages.
+- `flights_local.db`, `index_local.html` — local-run outputs (gitignored).
 
 ## GitHub Pages
 
-The report is published at https://la55u.github.io/japan-trips/results.html (served
-from the `main` branch root; it is the only HTML file — `results.css` carries the
-styles). The page is refreshed
+The report is published at https://la55u.github.io/japan-trips/ (index.html is
+generated directly by the scan; `results.css` carries the styles and is the only
+other web-served file). The page is refreshed
 automatically by the scheduled workflow; after a deliberate local scan against the
 repo DB, push as described in "Local vs CI data":
 
 ```bash
-git add results.html flights.db && git commit -m "scan: update results" && git push
+git add index.html flights.db && git commit -m "scan: update results" && git push
 ```

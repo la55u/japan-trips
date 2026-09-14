@@ -122,7 +122,7 @@ def parse_args():
         action="store_true",
         help="skip the Skyscanner spot-check this run",
     )
-    p.add_argument("--out", default=str(BASE / "results_local.html"))
+    p.add_argument("--out", default=str(BASE / "index_local.html"))
     return p.parse_args()
 
 

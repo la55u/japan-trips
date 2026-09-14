@@ -20,11 +20,11 @@ MUST be updated whenever behavior, schema, config, or pipeline changes.**
 - `test_flight_search.py` — stdlib unittest regression suite.
 - `config.toml` — all knobs (window, costs, TTL, cadence, skyscanner settings).
 - `flights.db` — CI-owned SQLite (committed). Local runs use `flights_local.db`.
-- `results.html` — generated report, deployed to GitHub Pages (CI-owned).
-- `results.css` — static stylesheet linked by results.html (must be committed;
+- `index.html` — generated report, deployed to GitHub Pages (CI-owned).
+- `results.css` — static stylesheet linked by index.html (must be committed;
   local `--out` runs into another directory won't style the page).
 - GitHub Pages has no root redirect page: the canonical URL is
-  https://la55u.github.io/japan-trips/results.html (results.html is the only HTML
+  https://la55u.github.io/japan-trips/ (index.html is the only HTML
   file in the repo).
 - `.github/workflows/scan.yml` — hourly scan job.
 - `requirements.txt` — pinned runtime and Ruff dependencies.
@@ -37,15 +37,15 @@ MUST be updated whenever behavior, schema, config, or pipeline changes.**
   `./venv/bin/python -m pip ...` or `./venv/bin/python script.py`).
 - The repository directory was previously renamed; do not rely on venv script shebangs.
 - GitHub: repo `la55u/japan-trips`, Pages at
-  https://la55u.github.io/japan-trips/results.html (branch `main`, root).
+  https://la55u.github.io/japan-trips/index.html (branch `main`, root).
 - Local test DB `flights_local.db` was seeded from `flights.db` once; it diverges.
 
 ## Data ownership (critical invariant)
 
 | Store | Writer | Committed |
 |---|---|---|
-| `flights.db`, `results.html` | CI ONLY (workflow passes `--db flights.db --out results.html`) | yes |
-| `flights_local.db`, `results_local.html` | local runs (gitignored defaults) | never |
+| `flights.db`, `index.html` | CI ONLY (workflow passes `--db flights.db --out index.html`) | yes |
+| `flights_local.db`, `index_local.html` | local runs (gitignored defaults) | never |
 
 Never commit local-run artifacts. If scanning against `flights.db` locally: `git pull
 --rebase` first, push promptly (SQLite cannot merge).
@@ -223,7 +223,7 @@ Other validation errors (e.g. ReturnValidationError) still count as failures.
   per-combo refresh times; `last_success_at` drives the tiered scheduler.
 - `price_history`, `itinerary_history`, and `runs` use 180-day retention.
 
-## HTML page (results.html)
+## HTML page (index.html)
 
 Template string `TEMPLATE` in flight_search.py, placeholders `__*__` replaced in
 render_html. Styles live in the static `results.css` (linked via `<link>`); the page
@@ -271,8 +271,8 @@ pip install → Ruff + unittest → `python -m camoufox fetch` → wait-for-idle
 jitter; GitHub's `concurrency: scan` group once failed to serialize a
 watchdog-dispatch + cron overlap and the loser died on a binary `flights.db`
 rebase conflict at the commit step, so this polls as defense in depth) →
-`python flight_search.py --limit 450 --db flights.db --out results.html` → commit
-`results.html` + `flights.db`
+`python flight_search.py --limit 450 --db flights.db --out index.html` → commit
+`index.html` + `flights.db`
 as github-actions[bot] with pull --rebase; conflicts fail visibly rather than silently
 discarding a completed scan → push (Pages redeploys automatically).
 Concurrency group `scan` (serial). timeout-minutes 60. Rate config: TTL 4h, 450/run
