@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from itertools import pairwise
 from pathlib import Path
+from urllib.parse import urlencode as _urlencode
 
 try:
     import tomllib
@@ -420,6 +421,47 @@ def _ss_url(origin, dest, d1, d2, domain, adults=2):
     )
 
 
+def _ss_multicity_url(legs, domain, adults=2):
+    """Skyscanner multi-city deep link (official referrals schema:
+    origin0/destination0/date0/origin1/... query params, YYYY-MM-DD dates)."""
+    params = [("adultsv2", adults), ("cabinclass", "economy")]
+    for i, (origin, dest, d) in enumerate(legs):
+        params += [(f"origin{i}", origin), (f"destination{i}", dest), (f"date{i}", d)]
+    return f"https://www.{domain}/transport/flights/multicity?" + _urlencode(params)
+
+
+def combo_legs(combo):
+    """Combo (tagged tuple) -> [(from, to, date), ...] for the search legs."""
+    if combo[0] == "OJ":
+        _, oo, ic, oc, h, d1, d2 = combo
+        return [(oo, ic, d1), (oc, h, d2)]
+    _, o, d, d1, d2 = combo
+    return [(o, d, d1), (d, o, d2)]
+
+
+def combo_key(combo, state_suffix):
+    """Storage/attempt key for a tagged combo. RT keys keep the historical
+    format `vN_a|origin|dest|d1|d2`; OJ keys add an explicit OJ segment plus
+    all four cities: `vN_a|OJ|out_origin|in_city|out_city|home|d1|d2`."""
+    if combo[0] == "OJ":
+        _, oo, ic, oc, h, d1, d2 = combo
+        return f"{state_suffix}|OJ|{oo}|{ic}|{oc}|{h}|{d1}|{d2}"
+    _, o, d, d1, d2 = combo
+    return f"{state_suffix}|{o}|{d}|{d1}|{d2}"
+
+
+def parse_ss_key(key):
+    """Parse a skyscanner_prices/skyscanner_attempts key into a tagged combo,
+    or None if the shape is unknown (legacy/garbage rows). The leading
+    version/adults prefix segment is dropped."""
+    parts = key.split("|")
+    if len(parts) == 5:
+        return ("RT", *parts[1:])
+    if len(parts) == 8 and parts[1] == "OJ":
+        return ("OJ", parts[2], parts[3], parts[4], parts[5], parts[6], parts[7])
+    return None
+
+
 def _solve_px(pg):
     cap = pg.locator("#px-captcha").first
     cap.wait_for(timeout=10000)
@@ -517,11 +559,25 @@ async ([payload, headers, topN, currency]) => {
     tries++;
   }
   if (searchCtx.status !== 'complete') return { http: 200, err: 'ctx:' + searchCtx.status, deals: [] };
-  const it = data.itineraries || {};
+  let it = data.itineraries || {};
+  let results = it.results || [];
+  // Results can stream in across poll snapshots; a complete-but-empty
+  // response gets a few extra polls before giving up.
+  let extra = 0;
+  while (!results.length && extra < 5) {
+    await new Promise(res => setTimeout(res, 2000));
+    const poll2 = await fetch(
+      '/g/radar/api/v2/web-unified-search/' + encodeURIComponent(searchCtx.sessionId),
+      { method: 'GET', headers: pollHeaders, credentials: 'include' });
+    if (poll2.status !== 200) break;
+    data = await poll2.json();
+    it = data.itineraries || {};
+    results = it.results || [];
+    extra++;
+  }
   const itCtx = it.context || {};
   const agents = {};
   for (const a of (it.agents || [])) agents[a.id] = a.name || a.id;
-  const results = (it.results || []).slice();
   results.sort((x, y) => (x.price && x.price.raw || 1e12) - (y.price && y.price.raw || 1e12));
   const deals = [];
   for (const r of results.slice(0, topN)) {
@@ -548,32 +604,38 @@ async ([payload, headers, topN, currency]) => {
 
 
 def _ss_fast_payload(origin, dest, d1, d2, adults=2):
-    """Build the web-unified-search POST body for an airport pair.
+    """Build the web-unified-search POST body for a round-trip airport pair.
     Place codes are Skyscanner 'a'-suffixed city codes (bud/tyoa) in URLs but
     the API body uses entityIds. Returns None if an entityId is unknown."""
-    eo = _SS_ENTITY_IDS.get(origin.upper())
-    ed = _SS_ENTITY_IDS.get(dest.upper())
-    if not eo or not ed:
-        return None
-    y1, m1, dd1 = d1.split("-")
-    y2, m2, dd2 = d2.split("-")
+    return _ss_fast_payload_legs([(origin, dest, d1), (dest, origin, d2)], adults)
+
+
+def _ss_fast_payload_legs(legs, adults=2):
+    """Build the web-unified-search POST body for arbitrary 2-leg searches
+    (round trip or open jaw: leg routes are independent). Returns None if any
+    entityId is unknown."""
+    body_legs = []
+    for i, (origin, dest, d) in enumerate(legs):
+        eo = _SS_ENTITY_IDS.get(origin.upper())
+        ed = _SS_ENTITY_IDS.get(dest.upper())
+        if not eo or not ed:
+            return None
+        y, m, dd = d.split("-")
+        leg = {
+            "legOrigin": {"@type": "entity", "entityId": eo},
+            "legDestination": {"@type": "entity", "entityId": ed},
+            "dates": {"@type": "date", "year": y, "month": m, "day": dd},
+        }
+        # Mirror the site's own RT payload: only the first leg carries
+        # placeOfStay (unknown whether multi-city legs behave differently).
+        if i == 0:
+            leg["placeOfStay"] = ed
+        body_legs.append(leg)
     return {
         "cabinClass": "ECONOMY",
         "childAges": [],
         "adults": adults,
-        "legs": [
-            {
-                "legOrigin": {"@type": "entity", "entityId": eo},
-                "legDestination": {"@type": "entity", "entityId": ed},
-                "dates": {"@type": "date", "year": y1, "month": m1, "day": dd1},
-                "placeOfStay": ed,
-            },
-            {
-                "legOrigin": {"@type": "entity", "entityId": ed},
-                "legDestination": {"@type": "entity", "entityId": eo},
-                "dates": {"@type": "date", "year": y2, "month": m2, "day": dd2},
-            },
-        ],
+        "legs": body_legs,
     }
 
 
@@ -581,13 +643,18 @@ def skyscanner_spotcheck(cfg, conn, combos):
     """Spot-check Skyscanner (OTA / self-transfer prices) for selected
     route/date combos via a camoufox browser. Returns rows to store.
 
+    Combos are tagged tuples: ("RT", origin, dest, d1, d2) round trips and
+    ("OJ", out_origin, in_city, out_city, home, d1, d2) open jaws (true
+    multi-city searches against the same web-unified-search API).
+
     Two fetch paths per combo:
     - fast: reuse the live page session and POST the unified-search API from
       inside the page (fetch) — ~1-4s per combo; needs known entityIds and a
       captured bootstrap request (for headers). Re-bootstraps the page every
       `fast_rebootstrap` fast queries; on failure falls back to navigation.
     - slow: navigate the SPA to the combo's search URL and capture the
-      response XHR (original behavior).
+      response XHR (original behavior). RT only — the multi-city SPA flow has
+      no reliable deep-link URL, so OJ combos are fast-path only.
     Per-combo try/except: one failing combo never blocks the rest."""
     from camoufox.sync_api import Camoufox
 
@@ -654,9 +721,14 @@ def skyscanner_spotcheck(cfg, conn, combos):
                     break
             return captured_req[-1] if captured_req else None
 
-        boot_req = _bootstrap(
-            _ss_url(*combos[0][:2], combos[0][2], combos[0][3], domain, adults)
-        )
+        def _bootstrap_url(combo):
+            """A plain RT search URL used to bootstrap/re-bootstrap the SPA.
+            The captured request headers are generic across search kinds, so
+            OJ combos bootstrap on their outbound leg's RT route."""
+            (o, d, d1), (_o2, _d2c, d2) = combo_legs(combo)
+            return _ss_url(o, d, d1, d2, domain, adults)
+
+        boot_req = _bootstrap(_bootstrap_url(combos[0]))
         skip_headers = {
             "host",
             "content-length",
@@ -692,9 +764,7 @@ def skyscanner_spotcheck(cfg, conn, combos):
             needs_reboot = False
             fast_mode = False
             try:
-                boot_req = _bootstrap(
-                    _ss_url(*combo[:2], combo[2], combo[3], domain, adults)
-                )
+                boot_req = _bootstrap(_bootstrap_url(combo))
                 fast_headers = _replay_headers(boot_req)
                 fast_mode = bool(fast_headers)
             except Exception as e:  # noqa: BLE001 - source remains best effort
@@ -732,99 +802,134 @@ def skyscanner_spotcheck(cfg, conn, combos):
             deals.sort(key=lambda d: d["price_raw"])
             return out.get("total", len(deals)), deals
 
-        for origin, dest, d1, d2 in combos:
-            if needs_reboot:
-                _rebootstrap((origin, dest, d1, d2))
-            done = False
-            # --- fast path: in-page API fetch ---
-            if fast_mode:
-                payload = _ss_fast_payload(origin, dest, d1, d2, adults)
-                if payload:
-                    try:
-                        out = pg.evaluate(
-                            _SS_FETCH_JS, [payload, fast_headers, top_deals, currency]
+        for combo in combos:
+            kind = combo[0]
+            d1, d2 = combo[-2], combo[-1]
+            desc = (
+                f"{combo[1]}->{combo[2]}+{combo[3]}->{combo[4]}"
+                if kind == "OJ"
+                else f"{combo[1]}->{combo[2]}"
+            )
+            oj_retries = 0
+            while True:
+                if needs_reboot:
+                    _rebootstrap(combo)
+                done = False
+                payload = None
+                # --- fast path: in-page API fetch ---
+                if fast_mode:
+                    payload = _ss_fast_payload_legs(combo_legs(combo), adults)
+                    if payload:
+                        try:
+                            out = pg.evaluate(
+                                _SS_FETCH_JS,
+                                [payload, fast_headers, top_deals, currency],
+                            )
+                            if out.get("http") == 200 and out.get("deals"):
+                                total, deals = _parse_fast(out)
+                                rows.append((kind, *combo[1:], total, deals))
+                                log.info(
+                                    "skyscanner(fast) %s %s %s..%s: %d results, top %s",
+                                    kind,
+                                    desc,
+                                    d1,
+                                    d2,
+                                    total,
+                                    f"{deals[0]['price_fmt']} ({deals[0]['agents'][0] if deals[0]['agents'] else '?'})"
+                                    if deals
+                                    else "none",
+                                )
+                                done = True
+                            else:
+                                log.info(
+                                    "skyscanner(fast) %s %s %s..%s: http=%s err=%s",
+                                    kind,
+                                    desc,
+                                    d1,
+                                    d2,
+                                    out.get("http"),
+                                    str(out.get("err"))[:40],
+                                )
+                        except Exception as e:  # noqa: BLE001 - fall back to navigation
+                            log.warning(
+                                "skyscanner(fast) %s %s failed: %s",
+                                kind,
+                                desc,
+                                str(e)[:120],
+                            )
+                        since_boot += 1
+                        if done and since_boot >= rebootstrap_every:
+                            _rebootstrap(combo)
+                if done:
+                    time.sleep(random.uniform(1, 2))
+                    break
+                # a fast attempt was made and failed: schedule a re-bootstrap
+                # so the next combo starts from a fresh session
+                if fast_mode and payload:
+                    needs_reboot = True
+                if kind == "OJ":
+                    # No reliable multi-city deep-link URL for the SPA slow
+                    # path; OJ combos are fast-path only. Fast POSTs fired
+                    # right after a bootstrap are sometimes 403'd, so retry
+                    # once from a fresh session before giving up.
+                    if oj_retries < 1:
+                        oj_retries += 1
+                        time.sleep(random.uniform(2, 4))
+                        continue
+                    log.warning(
+                        "skyscanner OJ %s %s..%s: fast path failed after "
+                        "retry, skipped (stays due)",
+                        desc,
+                        d1,
+                        d2,
+                    )
+                    break
+                origin, dest, _d1, _d2 = combo[1:]
+                # --- slow path: navigate the SPA (original behavior) ---
+                url = _ss_url(origin, dest, d1, d2, domain, adults)
+                captured.clear()
+                try:
+                    pg.goto(url, timeout=90000, wait_until="domcontentloaded")
+                    pg.wait_for_timeout(8000)
+                    _solve_px(url)
+                    for attempt in range(12):
+                        pg.wait_for_timeout(5000)
+                        if captured:
+                            break
+                    if captured:
+                        best_body = max(captured, key=len)
+                        total, deals = _parse_skyscanner_payload(
+                            best_body, domain, currency
                         )
-                        if out.get("http") == 200 and out.get("deals"):
-                            total, deals = _parse_fast(out)
-                            rows.append((origin, dest, d1, d2, total, deals))
-                            log.info(
-                                "skyscanner(fast) %s->%s %s..%s: %d results, top %s",
-                                origin,
-                                dest,
-                                d1,
-                                d2,
-                                total,
-                                f"{deals[0]['price_fmt']} ({deals[0]['agents'][0] if deals[0]['agents'] else '?'})"
-                                if deals
-                                else "none",
-                            )
-                            done = True
-                        else:
-                            log.info(
-                                "skyscanner(fast) %s->%s %s..%s: http=%s err=%s",
-                                origin,
-                                dest,
-                                d1,
-                                d2,
-                                out.get("http"),
-                                str(out.get("err"))[:40],
-                            )
-                    except Exception as e:  # noqa: BLE001 - fall back to navigation
-                        log.warning(
-                            "skyscanner(fast) %s->%s failed: %s",
+                        rows.append(("RT", origin, dest, d1, d2, total, deals))
+                        log.info(
+                            "skyscanner(slow) RT %s->%s %s..%s: %d results, top %s",
                             origin,
                             dest,
-                            str(e)[:120],
+                            d1,
+                            d2,
+                            total,
+                            f"{deals[0]['price_fmt']} ({deals[0]['agents'][0] if deals[0]['agents'] else '?'})"
+                            if deals
+                            else "none",
                         )
-                    since_boot += 1
-                    if done and since_boot >= rebootstrap_every:
-                        _rebootstrap((origin, dest, d1, d2))
-            if done:
-                time.sleep(random.uniform(1, 2))
-                continue
-            # a fast attempt was made and failed: schedule a re-bootstrap so
-            # the next combo starts from a fresh session
-            if fast_mode and payload:
-                needs_reboot = True
-            # --- slow path: navigate the SPA (original behavior) ---
-            url = _ss_url(origin, dest, d1, d2, domain, adults)
-            captured.clear()
-            try:
-                pg.goto(url, timeout=90000, wait_until="domcontentloaded")
-                pg.wait_for_timeout(8000)
-                _solve_px(url)
-                for attempt in range(12):
-                    pg.wait_for_timeout(5000)
-                    if captured:
-                        break
-                if captured:
-                    best_body = max(captured, key=len)
-                    total, deals = _parse_skyscanner_payload(
-                        best_body, domain, currency
-                    )
-                    rows.append((origin, dest, d1, d2, total, deals))
-                    log.info(
-                        "skyscanner %s->%s %s..%s: %d results, top %s",
-                        origin,
-                        dest,
-                        d1,
-                        d2,
-                        total,
-                        f"{deals[0]['price_fmt']} ({deals[0]['agents'][0] if deals[0]['agents'] else '?'})"
-                        if deals
-                        else "none",
-                    )
-                else:
+                    else:
+                        log.warning(
+                            "skyscanner(slow) RT %s->%s %s..%s: no results captured",
+                            origin,
+                            dest,
+                            d1,
+                            d2,
+                        )
+                except Exception as e:  # noqa: BLE001 - isolate each source query
                     log.warning(
-                        "skyscanner %s->%s %s..%s: no results captured",
+                        "skyscanner(slow) RT %s->%s failed: %s",
                         origin,
                         dest,
-                        d1,
-                        d2,
+                        str(e)[:120],
                     )
-            except Exception as e:  # noqa: BLE001 - isolate each source query
-                log.warning("skyscanner %s->%s failed: %s", origin, dest, str(e)[:120])
-            time.sleep(random.uniform(5, 10))
+                time.sleep(random.uniform(5, 10))
+                break
     return rows
 
 
@@ -841,7 +946,8 @@ def _ss_eur(price_raw, currency, huf_per_eur, eur_per_gbp):
 
 def _ss_universe(cfg):
     """Every RT route/date combination Skyscanner could ever check — the same
-    enumeration as the RT part of plan_queries."""
+    enumeration as the RT part of plan_queries. Returns untagged
+    (origin, dest, d1, d2) tuples (callers tag them)."""
     s = cfg["search"]
     start = date.fromisoformat(s["date_start"])
     end = date.fromisoformat(s["date_end"])
@@ -856,6 +962,32 @@ def _ss_universe(cfg):
                     if d2 > end:
                         continue
                     out.append((origin, dest, d.isoformat(), d2.isoformat()))
+        d += timedelta(days=step)
+    return out
+
+
+def _ss_oj_universe(cfg):
+    """Every open-jaw route/date combination: outbound home1→in_city on d1,
+    return out_city→home2 on d2 with 12–16 day spacing. Both Japan directions
+    (TYO in/OSA out and OSA in/TYO out), both origins independently as
+    departure and return city (mixed VIE/BUD trips included). Pure RT shapes
+    are impossible here because in_city != out_city always. Returns tagged
+    ("OJ", out_origin, in_city, out_city, home, d1, d2) tuples."""
+    s = cfg["search"]
+    start = date.fromisoformat(s["date_start"])
+    end = date.fromisoformat(s["date_end"])
+    step = s.get("step_days", 1)
+    out = []
+    d = start
+    while d <= end - timedelta(days=s["trip_min_days"]):
+        for oo in s["origins"]:
+            for h in s["origins"]:
+                for ic, oc in ((TYO, OSA), (OSA, TYO)):
+                    for dur in range(s["trip_min_days"], s["trip_max_days"] + 1):
+                        d2 = d + timedelta(days=dur)
+                        if d2 > end:
+                            continue
+                        out.append(("OJ", oo, ic, oc, h, d.isoformat(), d2.isoformat()))
         d += timedelta(days=step)
     return out
 
@@ -928,12 +1060,14 @@ def _travelpayouts_cheap_pairs(cfg):
 
 def _select_exploration(due, n):
     """Pick `n` exploration combos oldest-successful-first with round-robin
-    quotas per route (origin,dest) and per trip duration. `due` is a list of
-    (sort_key, combo) already ordered so that earlier entries are preferred."""
+    quotas per route and per trip duration. `due` is a list of
+    (sort_key, combo) already ordered so that earlier entries are preferred.
+    Combos are tagged tuples; route = all city segments, duration from the
+    trailing date pair."""
     by_route_dur = {}
     for sort_key, combo in due:
-        route = (combo[0], combo[1])
-        dur = (date.fromisoformat(combo[3]) - date.fromisoformat(combo[2])).days
+        route = tuple(combo[1:-2])
+        dur = (date.fromisoformat(combo[-1]) - date.fromisoformat(combo[-2])).days
         by_route_dur.setdefault((route, dur), []).append((sort_key, combo))
     for lst in by_route_dur.values():
         lst.sort()
@@ -998,9 +1132,9 @@ def run_skyscanner_if_due(cfg, conn, args, itins):
         "WHERE key LIKE ?",
         (f"{state_suffix}|%",),
     ):
-        parts = key.split("|", 1)
-        if len(parts) == 2:
-            attempts[tuple(parts[1].split("|"))] = (last_success, last_attempt)
+        combo = parse_ss_key(key)
+        if combo is not None:
+            attempts[combo] = (last_success, last_attempt)
 
     def _combo(it):
         return (it["out_origin"], it["in_city"], it["d1"], it["d2"])
@@ -1011,16 +1145,27 @@ def run_skyscanner_if_due(cfg, conn, args, itins):
         if it["kind"] == "RT":
             rt_map.setdefault(key, it["airfare"])
 
+    valid_rt_routes = {(o, d) for o in s["origins"] for d in s["destinations"]}
+    oj_city_pairs = {(TYO, OSA), (OSA, TYO)}
+
+    def _valid_stored(combo):
+        if combo[0] == "OJ":
+            _, oo, ic, oc, h, _d1, _d2 = combo
+            return (
+                oo in s["origins"] and h in s["origins"] and (ic, oc) in oj_city_pairs
+            )
+        _, o, d, _d1, _d2 = combo
+        return (o, d) in valid_rt_routes
+
     stored = []
     for row in conn.execute(
-        "SELECT origin, dest, d1, d2, deals_json, fetched_at FROM skyscanner_prices "
+        "SELECT key, deals_json, fetched_at FROM skyscanner_prices "
         "WHERE adults=? AND deals_json IS NOT NULL",
         (adults,),
     ):
-        origin, dest, d1, d2, deals_json, fetched_at = row
-        if (origin, dest) not in {
-            (o, d) for o in s["origins"] for d in s["destinations"]
-        }:
+        key, deals_json, fetched_at = row
+        combo = parse_ss_key(key)
+        if combo is None or not _valid_stored(combo):
             continue
         try:
             deals = json.loads(deals_json)
@@ -1030,7 +1175,8 @@ def run_skyscanner_if_due(cfg, conn, args, itins):
         if eurs:
             stored.append(
                 {
-                    "combo": (origin, dest, d1, d2),
+                    "combo": combo,
+                    "kind": combo[0],
                     "best_eur": min(eurs),
                     "age": _age_hours(fetched_at),
                 }
@@ -1046,10 +1192,13 @@ def run_skyscanner_if_due(cfg, conn, args, itins):
         combos.append(r["combo"])
         seen.add(r["combo"])
 
-    # --- neighbour tier: ±1..3 days around deals that strongly beat Google ---
+    # --- neighbour tier: ±1..3 days around deals that strongly beat Google
+    # (RT only: the gap is defined against the Google RT fare map) ---
     strong = []
     for r in stored:
-        gap = rt_map.get(r["combo"])
+        if r["kind"] != "RT":
+            continue
+        gap = rt_map.get(r["combo"][1:])
         if gap is not None and gap - r["best_eur"] > 100:
             strong.append((gap - r["best_eur"], r))
     strong.sort(key=lambda pair: pair[0], reverse=True)
@@ -1070,8 +1219,9 @@ def run_skyscanner_if_due(cfg, conn, args, itins):
             ):
                 continue
             candidate = (
-                r["combo"][0],
+                "RT",
                 r["combo"][1],
+                r["combo"][2],
                 shifted_d1.isoformat(),
                 shifted_d2.isoformat(),
             )
@@ -1085,25 +1235,37 @@ def run_skyscanner_if_due(cfg, conn, args, itins):
             n_neighbour_taken += 1
             break
 
-    # --- exploration tier: unseen first, then oldest successful check ---
-    universe = _ss_universe(cfg)
+    # --- exploration tier: unseen first, then oldest successful check.
+    # RT and OJ universes get separate quotas so OJ coverage cannot starve
+    # the (smaller) RT universe or vice versa. ---
     tp_pairs = _travelpayouts_cheap_pairs(cfg)
-    due = []
-    for combo in universe:
-        if combo in seen:
-            continue
-        last_success, _last_attempt = attempts.get(combo, (None, None))
-        if last_success:
-            age = _age_hours(last_success)
-            if age is not None and age < explore_refresh:
+    n_oj_explore = (
+        sk_cfg.get("explore_oj_combos", 10) if sk_cfg.get("oj_enabled", True) else 0
+    )
+
+    def _due_for(universe):
+        out = []
+        for combo in universe:
+            if combo in seen:
                 continue
-            sort_key = (1, last_success, combo)
-        else:
-            sort_key = (0, "", combo)
-        if combo in tp_pairs:
-            sort_key = (0, f"{tp_pairs[combo]:010.2f}", combo)
-        due.append((sort_key, combo))
-    combos.extend(_select_exploration(due, n_explore))
+            last_success, _last_attempt = attempts.get(combo, (None, None))
+            if last_success:
+                age = _age_hours(last_success)
+                if age is not None and age < explore_refresh:
+                    continue
+                sort_key = (1, last_success, combo)
+            else:
+                sort_key = (0, "", combo)
+            if combo[0] == "RT" and combo[1:] in tp_pairs:
+                sort_key = (0, f"{tp_pairs[combo[1:]]:010.2f}", combo)
+            out.append((sort_key, combo))
+        return out
+
+    universe = [("RT", *c) for c in _ss_universe(cfg)]
+    combos.extend(_select_exploration(_due_for(universe), n_explore))
+    if n_oj_explore:
+        oj_universe = _ss_oj_universe(cfg)
+        combos.extend(_select_exploration(_due_for(oj_universe), n_oj_explore))
 
     n_hot_taken = min(len(hot_due), n_hot)
     n_explore_taken = max(0, len(combos) - n_hot_taken - n_neighbour_taken)
@@ -1118,7 +1280,7 @@ def run_skyscanner_if_due(cfg, conn, args, itins):
         n_explore_taken,
         hot_refresh,
         explore_refresh,
-        sum(1 for c in combos if c in tp_pairs),
+        sum(1 for c in combos if c[0] == "RT" and c[1:] in tp_pairs),
     )
     log.info("skyscanner spot-check starting for %d combos", len(combos))
     try:
@@ -1131,7 +1293,7 @@ def run_skyscanner_if_due(cfg, conn, args, itins):
     eur_per_gbp = cfg["currency"].get("eur_per_gbp", 1.17)
     expected_currency = sk_cfg.get("currency", "HUF").upper()
     normalized_rows = []
-    for origin, dest, d1, d2, total, deals in rows:
+    for kind, *cities, total, deals in rows:
         slim = []
         currencies = set()
         for raw_deal in deals[: sk_cfg.get("top_deals", 10)]:
@@ -1155,19 +1317,19 @@ def run_skyscanner_if_due(cfg, conn, args, itins):
                 if currencies
                 else expected_currency
             )
-            normalized_rows.append((origin, dest, d1, d2, total, slim, row_currency))
+            normalized_rows.append((kind, *cities, total, slim, row_currency))
         else:
             log.warning(
-                "skyscanner %s->%s %s..%s had no valid currency/price rows",
-                origin,
-                dest,
-                d1,
-                d2,
+                "skyscanner %s %s %s..%s had no valid currency/price rows",
+                kind,
+                "+".join(cities[:-2]),
+                cities[-2],
+                cities[-1],
             )
     rows = normalized_rows
-    successful = {(r[0], r[1], r[2], r[3]) for r in rows}
+    successful = {tuple(r[: len(r) - 3]) for r in rows}
     for combo in combos:
-        attempt_key = "|".join((state_suffix, *combo))
+        attempt_key = combo_key(combo, state_suffix)
         if combo in successful:
             conn.execute(
                 """INSERT INTO skyscanner_attempts
@@ -1196,8 +1358,17 @@ def run_skyscanner_if_due(cfg, conn, args, itins):
         )
         return
 
-    for origin, dest, d1, d2, total, slim, row_currency in rows:
-        key = f"{state_suffix}|{origin}|{dest}|{d1}|{d2}"
+    for row in rows:
+        kind = row[0]
+        if kind == "OJ":
+            _kind, oo, ic, oc, h, d1, d2, total, slim, row_currency = row
+            combo = ("OJ", oo, ic, oc, h, d1, d2)
+            col_origin, col_dest = oo, h
+        else:
+            _kind, o, d, d1, d2, total, slim, row_currency = row
+            combo = ("RT", o, d, d1, d2)
+            col_origin, col_dest = o, d
+        key = combo_key(combo, state_suffix)
         conn.execute(
             "INSERT INTO skyscanner_prices (key, origin, dest, d1, d2, total_results, deals_json, fetched_at, adults, currency)"
             " VALUES (?,?,?,?,?,?,?,?,?,?)"
@@ -1206,8 +1377,8 @@ def run_skyscanner_if_due(cfg, conn, args, itins):
             " adults=excluded.adults, currency=excluded.currency",
             (
                 key,
-                origin,
-                dest,
+                col_origin,
+                col_dest,
                 d1,
                 d2,
                 total,
@@ -1818,8 +1989,8 @@ def load_rows(conn, cfg):
 def load_ss_rows(conn, cfg):
     prefix = f"v{CACHE_VERSION}_{cfg['search'].get('adults', 2)}|%"
     return conn.execute(
-        "SELECT origin, dest, d1, d2, total_results, deals_json, fetched_at, "
-        "adults, currency FROM skyscanner_prices WHERE key LIKE ? "
+        "SELECT key, origin, dest, d1, d2, total_results, deals_json, "
+        "fetched_at, adults, currency FROM skyscanner_prices WHERE key LIKE ? "
         "ORDER BY fetched_at DESC",
         (prefix,),
     ).fetchall()
@@ -1830,7 +2001,9 @@ def _ss_itineraries(cfg, ss_rows):
     Ranking is independent of Google: deals are kept even without a matching
     Google round-trip (OTA/self-transfer fares often undercut it invisibly).
     Rows older than indicative_after_hours stay visible but are flagged
-    'indicative'; rows older than max_age_hours are dropped."""
+    'indicative'; rows older than max_age_hours are dropped. Both RT rows
+    (round-trip searches) and OJ rows (true multi-city open-jaw searches,
+    recognized by the OJ marker in the storage key) are handled."""
     out = []
     s = cfg["search"]
     sk_cfg = cfg.get("skyscanner", {})
@@ -1846,7 +2019,9 @@ def _ss_itineraries(cfg, ss_rows):
     bag_estimate = sk_cfg.get("checked_bag_estimate_eur", 0)
     start = date.fromisoformat(s["date_start"])
     end = date.fromisoformat(s["date_end"])
+    oj_city_pairs = {(TYO, OSA), (OSA, TYO)}
     for (
+        key,
         origin,
         dest,
         d1,
@@ -1857,14 +2032,24 @@ def _ss_itineraries(cfg, ss_rows):
         adults,
         _currency,
     ) in ss_rows:
+        combo = parse_ss_key(key)
+        if combo is None:
+            continue
+        if combo[0] == "OJ":
+            _k, out_origin, in_city, out_city, ret_dest = combo[:5]
+            if (in_city, out_city) not in oj_city_pairs:
+                continue
+        else:
+            out_origin = ret_dest = combo[1]
+            in_city = out_city = combo[2]
         dep_date = date.fromisoformat(d1)
         ret_date = date.fromisoformat(d2)
         duration = (ret_date - dep_date).days
         age = _age_hours(fetched_at)
         if (
             adults != s.get("adults", 2)
-            or origin not in s["origins"]
-            or dest not in s["destinations"]
+            or out_origin not in s["origins"]
+            or ret_dest not in s["origins"]
             or not start <= dep_date < ret_date <= end
             or not s["trip_min_days"] <= duration <= s["trip_max_days"]
             or age is None
@@ -1874,19 +2059,23 @@ def _ss_itineraries(cfg, ss_rows):
         deals = json.loads(deals_json)
         if not deals:
             continue
+        # leg 1 must start at the departure city and end inside the inbound
+        # Japan city; leg 2 must start inside the outbound Japan city and end
+        # at the final return city (same as the departure city for RT rows).
+        valid_in = {in_city, *CITIES.get(in_city, set())}
+        valid_out = {out_city, *CITIES.get(out_city, set())}
         accepted_keys = set()
-        valid_destinations = {dest, *CITIES.get(dest, set())}
         for deal in deals:
             eur = deal.get("eur")
             legs = deal.get("legs") or []
             if (
                 eur is None
                 or len(legs) != 2
-                or legs[0].get("from") != origin
-                or legs[0].get("to") not in valid_destinations
+                or legs[0].get("from") != out_origin
+                or legs[0].get("to") not in valid_in
                 or (legs[0].get("dep") or "")[:10] != d1
-                or legs[1].get("from") not in valid_destinations
-                or legs[1].get("to") != origin
+                or legs[1].get("from") not in valid_out
+                or legs[1].get("to") != ret_dest
                 or (legs[1].get("dep") or "")[:10] != d2
                 or any((leg.get("stops") or 0) > s["max_stops"] for leg in legs)
                 or any(
@@ -1921,11 +2110,12 @@ def _ss_itineraries(cfg, ss_rows):
                 )
             while len(leg_details) < 2:
                 leg_details.append(None)
-            tr_total, tr_items = transfers_for("RT", origin, origin, cfg)
+            kind = "OJ" if combo[0] == "OJ" else "RT"
+            tr_total, tr_items = transfers_for(kind, out_origin, ret_dest, cfg)
             agent = ", ".join(deal.get("agents", [])[:1])
             identity = json.dumps(
                 {
-                    "route": [origin, dest, d1, d2],
+                    "route": [out_origin, in_city, out_city, ret_dest, d1, d2],
                     "agents": deal.get("agents", []),
                     "legs": [
                         {
@@ -1943,15 +2133,22 @@ def _ss_itineraries(cfg, ss_rows):
                 separators=(",", ":"),
             )
             digest = hashlib.sha256(identity.encode()).hexdigest()[:16]
-            itinerary_key = f"SS|{origin}|{dest}|{d1}|{d2}|{digest}"
+            if combo[0] == "OJ":
+                itinerary_key = (
+                    f"SS|OJ|{out_origin}|{in_city}|{out_city}|{ret_dest}"
+                    f"|{d1}|{d2}|{digest}"
+                )
+            else:
+                itinerary_key = f"SS|{out_origin}|{in_city}|{d1}|{d2}|{digest}"
             out.append(
                 {
                     "key": itinerary_key,
                     "kind": "SS",
-                    "out_origin": origin,
-                    "ret_dest": origin,
-                    "in_city": dest,
-                    "out_city": dest,
+                    "ss_oj": combo[0] == "OJ",
+                    "out_origin": out_origin,
+                    "ret_dest": ret_dest,
+                    "in_city": in_city,
+                    "out_city": out_city,
                     "d1": d1,
                     "d2": d2,
                     "airfare": eur + bag_estimate,
@@ -2195,10 +2392,11 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
     for i, it in enumerate(shown, 1):
         o, r = it["out_detail"], it["ret_detail"]
         trip_days = (date.fromisoformat(it["d2"]) - date.fromisoformat(it["d1"])).days
+        is_ss_oj = it["kind"] == "SS" and it.get("ss_oj")
         kind_label = {
             "RT": "Round trip",
             "OJ": "Open jaw",
-            "SS": "Round trip · OTA",
+            "SS": "Open jaw · OTA" if is_ss_oj else "Round trip · OTA",
         }[it["kind"]]
         route_txt = f"{it['out_origin']} → {it['in_city']} · {it['out_city']} → {it['ret_dest']}"
         delta_html = ""
@@ -2208,39 +2406,59 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
             arrow = "▼" if diff < 0 else "▲"
             delta_html = f' <span class="{cls}" title="vs previous run">{arrow} {abs(diff):.0f}</span>'
         gf_links = []
+        is_gf_oj = it["kind"] == "OJ" or is_ss_oj
         q1 = build_query(
-            "OW" if it["kind"] == "OJ" else "RT",
+            "OW" if is_gf_oj else "RT",
             it["out_origin"],
             it["in_city"],
             it["d1"],
-            None if it["kind"] == "OJ" else it["d2"],
+            None if is_gf_oj else it["d2"],
             cfg,
         )
         gf_links.append(("Google", q1.url()))
-        if it["kind"] == "OJ":
+        if is_gf_oj:
             q2 = build_query("OW", it["out_city"], it["ret_dest"], it["d2"], None, cfg)
             gf_links.append(("Google", q2.url()))
         if it["kind"] == "SS":
-            gf_links.append(
-                (
-                    "Skyscanner",
-                    _ss_url(
-                        it["out_origin"],
-                        it["in_city"],
-                        it["d1"],
-                        it["d2"],
-                        ss_domain,
-                        cfg["search"].get("adults", 2),
-                    ),
+            if is_ss_oj:
+                gf_links.append(
+                    (
+                        "Skyscanner",
+                        _ss_multicity_url(
+                            [
+                                (it["out_origin"], it["in_city"], it["d1"]),
+                                (it["out_city"], it["ret_dest"], it["d2"]),
+                            ],
+                            ss_domain,
+                            cfg["search"].get("adults", 2),
+                        ),
+                    )
                 )
-            )
+            else:
+                gf_links.append(
+                    (
+                        "Skyscanner",
+                        _ss_url(
+                            it["out_origin"],
+                            it["in_city"],
+                            it["d1"],
+                            it["d2"],
+                            ss_domain,
+                            cfg["search"].get("adults", 2),
+                        ),
+                    )
+                )
         links = " ".join(
             f'<a class="gf" href="{u}" target="_blank" rel="noopener">{name} ↗</a>'
             for name, u in gf_links
         )
         tr_items = "; ".join(f"{n} ({v:.0f})" for n, v in it["transfer_items"])
         idx = i - 1
-        badge_cls = "badge" if it["kind"] in ("RT", "SS") else "badge oj"
+        badge_cls = (
+            "badge"
+            if it["kind"] == "RT" or (it["kind"] == "SS" and not is_ss_oj)
+            else "badge oj"
+        )
         agent_html = ""
         if it["kind"] == "SS":
             extras = []
@@ -2458,13 +2676,18 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
         "WHERE key LIKE ? AND last_success_at IS NOT NULL",
         (ss_prefix,),
     ).fetchone()
+    sk_cfg_stats = cfg.get("skyscanner", {})
     ss_total = len(_ss_universe(cfg))
+    if sk_cfg_stats.get("oj_enabled", True):
+        ss_total += len(_ss_oj_universe(cfg))
     ss_stored = conn.execute(
         "SELECT COUNT(*) FROM skyscanner_prices WHERE key LIKE ?", (ss_prefix,)
     ).fetchone()[0]
     if ss_total:
-        sk_cfg = cfg.get("skyscanner", {})
-        n_explore = max(1, sk_cfg.get("explore_combos", 25))
+        sk_cfg = sk_cfg_stats
+        n_explore = max(1, sk_cfg_stats.get("explore_combos", 25))
+        if sk_cfg_stats.get("oj_enabled", True):
+            n_explore += sk_cfg_stats.get("explore_oj_combos", 10)
         remaining = max(0, ss_total - ss_checked)
         runs_needed = (remaining + n_explore - 1) // n_explore
         sweep_days = runs_needed * sk_cfg.get("min_age_hours", 3) / 24
@@ -2491,11 +2714,15 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
     route_best = {}
     for ts, k, total in hist_rows:
         parts = k.split("|")
-        if len(parts) >= 3 and parts[0] in ("RT", "OJ", "SS"):
+        if parts[0] == "SS" and len(parts) >= 6 and parts[1] == "OJ":
+            route = f"{parts[2]}→{parts[3]}+{parts[4]}→{parts[5]}"
+        elif len(parts) >= 3 and parts[0] in ("RT", "OJ", "SS"):
             route = f"{parts[1]}→{parts[2]}"
-            per_run = route_best.setdefault(ts, {})
-            if route not in per_run or total < per_run[route]:
-                per_run[route] = total
+        else:
+            continue
+        per_run = route_best.setdefault(ts, {})
+        if route not in per_run or total < per_run[route]:
+            per_run[route] = total
     route_names = sorted({r for d in route_best.values() for r in d})
     route_datasets = []
     for idx, route in enumerate(route_names):
@@ -2639,9 +2866,11 @@ __ROWS__
   last checked more than a day ago — re-verify via the Skyscanner link before booking.
   The <i>Max leg h</i> filter (default 24) hides rows where any single leg is longer —
   raise it to uncover cheaper but slower OTA itineraries (durations turn red above 24h).
-  Untick <i>Bag fees</i> to compare OTA fares without the estimated checked-bag cost —
-  summary cards and Google rows always include everything.
-  Open jaw = sum of two one-ways (verify the true multi-city price via the GF links).
+   Untick <i>Bag fees</i> to compare OTA fares without the estimated checked-bag cost —
+   summary cards and Google rows always include everything.
+   Open jaw = sum of two one-ways (verify the true multi-city price via the GF links).
+   <i>Open jaw · OTA</i> rows come from true Skyscanner multi-city searches (single
+   OTA booking for both legs) — still OTA fares with the same caveats.
   Times are local; (+n) = arrival n days after departure; duration includes layovers.
   For round trips the return leg is the actual flight paired with the shown outbound when
   available (fetched via Google's selection API), otherwise a <i>reference</i> (the best
@@ -2890,8 +3119,11 @@ def label_itins(itins):
     labels = {"RT": "Round trip", "OJ": "Open jaw", "SS": "Skyscanner RT"}
     for it in itins:
         direction = f"{it['in_city']}/{it['out_city']}"
+        label = labels[it["kind"]]
+        if it["kind"] == "SS" and it.get("ss_oj"):
+            label = "Skyscanner OJ"
         it["label"] = (
-            f"{labels[it['kind']]} {it['out_origin']}→{it['ret_dest']} "
+            f"{label} {it['out_origin']}→{it['ret_dest']} "
             f"(via {direction}) {it['d1']} → {it['d2']}"
         )
 

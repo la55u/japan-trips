@@ -58,6 +58,52 @@ def detail(route, hours=18):
     }
 
 
+def ss_row(
+    deals_json,
+    fetched_at,
+    origin="BUD",
+    in_city="TYO",
+    out_city=None,
+    home=None,
+    d1="2027-03-22",
+    d2="2027-04-03",
+    total=1,
+    adults=2,
+    currency="HUF",
+):
+    """Build a skyscanner_prices row tuple in the shape _ss_itineraries reads.
+    Defaults to a BUD-TYO round trip. out_city/home turn it into an open-jaw
+    (multi-city) row with key v2_2|OJ|origin|in_city|out_city|home|d1|d2."""
+    if out_city is not None or home is not None:
+        oc = out_city or in_city
+        h = home or origin
+        key = f"v2_2|OJ|{origin}|{in_city}|{oc}|{h}|{d1}|{d2}"
+        return (
+            key,
+            origin,
+            h,
+            d1,
+            d2,
+            total,
+            deals_json,
+            fetched_at,
+            adults,
+            currency,
+        )
+    return (
+        f"v2_2|{origin}|{in_city}|{d1}|{d2}",
+        origin,
+        in_city,
+        d1,
+        d2,
+        total,
+        deals_json,
+        fetched_at,
+        adults,
+        currency,
+    )
+
+
 class RankingTests(unittest.TestCase):
     def test_round_trip_endpoint_cost_and_open_jaw_uniqueness(self):
         cfg = config()
@@ -283,22 +329,12 @@ class SkyscannerTests(unittest.TestCase):
                 },
             ],
         }
-        row = (
-            "BUD",
-            "TYO",
-            "2027-03-22",
-            "2027-04-03",
-            100,
-            json.dumps([deal]),
-            fetched,
-            2,
-            "HUF",
-        )
+        row = ss_row(json.dumps([deal]), fetched, total=100)
         first = fs._ss_itineraries(cfg, [row])
         changed = deepcopy(deal)
         changed["eur"] = 350.0
         changed["price_fmt"] = "280 000 Ft"
-        second_row = (*row[:5], json.dumps([changed]), *row[6:])
+        second_row = (*row[:6], json.dumps([changed]), *row[7:])
         second = fs._ss_itineraries(cfg, [second_row])
 
         self.assertEqual(first[0]["key"], second[0]["key"])
@@ -316,17 +352,7 @@ class SkyscannerTests(unittest.TestCase):
                 {"from": "HND", "to": "BUD", "stops": 1},
             ],
         }
-        row = (
-            "BUD",
-            "TYO",
-            "2027-03-22",
-            "2027-04-03",
-            1,
-            json.dumps([deal]),
-            fetched,
-            2,
-            "HUF",
-        )
+        row = ss_row(json.dumps([deal]), fetched)
         self.assertEqual(fs._ss_itineraries(cfg, [row]), [])
 
     def test_invalid_deals_are_skipped_before_accepting_eligible_ones(self):
@@ -354,17 +380,7 @@ class SkyscannerTests(unittest.TestCase):
         valid["eur"] = 300
         valid["agents"] = ["Valid"]
         valid["legs"][0]["stops"] = 1
-        row = (
-            "BUD",
-            "TYO",
-            "2027-03-22",
-            "2027-04-03",
-            3,
-            json.dumps([invalid, invalid, valid]),
-            fetched,
-            2,
-            "HUF",
-        )
+        row = ss_row(json.dumps([invalid, invalid, valid]), fetched, total=3)
 
         result = fs._ss_itineraries(cfg, [row])
 
@@ -394,17 +410,7 @@ class SkyscannerTests(unittest.TestCase):
                 },
             ],
         }
-        row = (
-            "BUD",
-            "TYO",
-            "2027-03-22",
-            "2027-04-03",
-            1,
-            json.dumps([deal]),
-            fetched,
-            2,
-            "HUF",
-        )
+        row = ss_row(json.dumps([deal]), fetched)
 
         result = fs._ss_itineraries(cfg, [row])
 
@@ -440,17 +446,7 @@ class SkyscannerTests(unittest.TestCase):
                     ],
                 }
             )
-        row = (
-            "BUD",
-            "TYO",
-            "2027-03-22",
-            "2027-04-03",
-            6,
-            json.dumps(deals),
-            fetched,
-            2,
-            "HUF",
-        )
+        row = ss_row(json.dumps(deals), fetched, total=6)
 
         result = fs._ss_itineraries(cfg, [row])
 
@@ -478,22 +474,12 @@ class SkyscannerTests(unittest.TestCase):
                 },
             ],
         }
-        row = (
-            "BUD",
-            "TYO",
-            "2027-03-22",
-            "2027-04-03",
-            1,
-            json.dumps([deal]),
-            "2026-09-11T00:00:00Z",  # ~60h old at test run time
-            2,
-            "HUF",
-        )
+        row = ss_row(json.dumps([deal]), "2026-09-11T00:00:00Z")
         result = fs._ss_itineraries(cfg, [row])
         self.assertEqual(len(result), 1)
         self.assertTrue(result[0]["indicative"])
 
-        expired = (*row[:6], "2026-05-01T00:00:00Z", *row[7:])
+        expired = ss_row(json.dumps([deal]), "2026-05-01T00:00:00Z")
         self.assertEqual(fs._ss_itineraries(cfg, [expired]), [])
 
     def test_deal_cheaper_than_google_is_not_required_anymore(self):
@@ -518,17 +504,7 @@ class SkyscannerTests(unittest.TestCase):
                 },
             ],
         }
-        row = (
-            "BUD",
-            "TYO",
-            "2027-03-22",
-            "2027-04-03",
-            1,
-            json.dumps([deal]),
-            fetched,
-            2,
-            "HUF",
-        )
+        row = ss_row(json.dumps([deal]), fetched)
 
         # Google RT at 500 — the deal is more expensive but still ranked
         result = fs._ss_itineraries(cfg, [row])
@@ -557,16 +533,9 @@ class SkyscannerTests(unittest.TestCase):
                 },
             ],
         }
-        return (
-            "BUD",
-            "TYO",
-            "2027-03-22",
-            "2027-04-03",
-            1,
+        return ss_row(
             json.dumps([deal]),
             datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            2,
-            "HUF",
         )
 
     def test_ota_deals_over_google_leg_cap_kept_up_to_display_cap(self):
@@ -593,17 +562,17 @@ class SkyscannerTests(unittest.TestCase):
         due = [
             ((0, "", c), c)
             for c in [
-                ("BUD", "TYO", "2027-03-22", "2027-04-03"),
-                ("BUD", "OSA", "2027-03-22", "2027-04-03"),
-                ("VIE", "TYO", "2027-03-22", "2027-04-03"),
-                ("VIE", "OSA", "2027-03-22", "2027-04-05"),
-                ("VIE", "OSA", "2027-03-23", "2027-04-06"),
+                ("RT", "BUD", "TYO", "2027-03-22", "2027-04-03"),
+                ("RT", "BUD", "OSA", "2027-03-22", "2027-04-03"),
+                ("RT", "VIE", "TYO", "2027-03-22", "2027-04-03"),
+                ("RT", "VIE", "OSA", "2027-03-22", "2027-04-05"),
+                ("RT", "VIE", "OSA", "2027-03-23", "2027-04-06"),
             ]
         ]
         picked = fs._select_exploration(due, 3)
         self.assertEqual(len(picked), 3)
         # round-robin across (route, duration) cells, oldest within each
-        routes = {(c[0], c[1]) for c in picked}
+        routes = {(c[1], c[2]) for c in picked}
         self.assertLessEqual(len(routes), 3)
 
     def test_wrong_route_or_date_is_excluded(self):
@@ -627,17 +596,7 @@ class SkyscannerTests(unittest.TestCase):
                 },
             ],
         }
-        row = (
-            "BUD",
-            "TYO",
-            "2027-03-22",
-            "2027-04-03",
-            1,
-            json.dumps([deal]),
-            fetched,
-            2,
-            "HUF",
-        )
+        row = ss_row(json.dumps([deal]), fetched, origin="VIE")
 
         self.assertEqual(fs._ss_itineraries(cfg, [row]), [])
 
@@ -666,21 +625,131 @@ class SkyscannerTests(unittest.TestCase):
         }
         second = deepcopy(first)
         second["agents"] = ["Second"]
-        row = (
-            "BUD",
-            "TYO",
-            "2027-03-22",
-            "2027-04-03",
-            3,
-            json.dumps([first, first, second]),
-            fetched,
-            2,
-            "HUF",
-        )
+        row = ss_row(json.dumps([first, first, second]), fetched, total=3)
 
         result = fs._ss_itineraries(cfg, [row])
 
         self.assertEqual(len(result), 2)
+
+    def test_open_jaw_deal_is_ranked_as_oj(self):
+        cfg = config()
+        cfg["skyscanner"]["checked_bag_estimate_eur"] = 0
+        fetched = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        deal = {
+            "eur": 400,
+            "agents": ["Agent"],
+            "legs": [
+                {
+                    "from": "VIE",
+                    "to": "HND",
+                    "stops": 1,
+                    "dep": "2027-03-22T12:10",
+                    "arr": "2027-03-23T18:05",
+                },
+                {
+                    "from": "KIX",
+                    "to": "BUD",
+                    "stops": 2,
+                    "dep": "2027-04-03T14:00",
+                    "arr": "2027-04-04T07:00",
+                },
+            ],
+        }
+        row = ss_row(
+            json.dumps([deal]),
+            fetched,
+            origin="VIE",
+            in_city="TYO",
+            out_city="OSA",
+            home="BUD",
+        )
+
+        result = fs._ss_itineraries(cfg, [row])
+
+        self.assertEqual(len(result), 1)
+        it = result[0]
+        self.assertTrue(it["ss_oj"])
+        self.assertEqual(it["out_origin"], "VIE")
+        self.assertEqual(it["in_city"], "TYO")
+        self.assertEqual(it["out_city"], "OSA")
+        self.assertEqual(it["ret_dest"], "BUD")
+        # open jaw: shinkansen only (no domestic flight), one FlixBus leg (VIE out)
+        self.assertEqual(it["transfers"], 105.0)
+        self.assertTrue(it["key"].startswith("SS|OJ|VIE|TYO|OSA|BUD|"))
+
+    def test_open_jaw_wrong_return_city_is_excluded(self):
+        cfg = config()
+        fetched = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        deal = {
+            "eur": 400,
+            "agents": ["Agent"],
+            "legs": [
+                {"from": "VIE", "to": "HND", "stops": 1, "dep": "2027-03-22T12:10"},
+                {"from": "KIX", "to": "VIE", "stops": 1, "dep": "2027-04-03T14:00"},
+            ],
+        }
+        row = ss_row(
+            json.dumps([deal]),
+            fetched,
+            origin="VIE",
+            in_city="TYO",
+            out_city="OSA",
+            home="BUD",
+        )
+        self.assertEqual(fs._ss_itineraries(cfg, [row]), [])
+
+    def test_open_jaw_universe_shapes_and_dates(self):
+        cfg = config()
+        universe = fs._ss_oj_universe(cfg)
+        # 2 out origins x 2 return homes x 2 Japan directions x 1 date pair
+        self.assertEqual(len(universe), 8)
+        for combo in universe:
+            self.assertEqual(combo[0], "OJ")
+            self.assertIn((combo[2], combo[3]), (("TYO", "OSA"), ("OSA", "TYO")))
+            self.assertIn(combo[1], ("BUD", "VIE"))
+            self.assertIn(combo[4], ("BUD", "VIE"))
+        # no pure round trips: Japan cities always differ
+        self.assertTrue(all(c[2] != c[3] for c in universe))
+
+    def test_combo_key_and_parse_round_trip(self):
+        rt = ("RT", "BUD", "TYO", "2027-03-22", "2027-04-03")
+        oj = ("OJ", "VIE", "TYO", "OSA", "BUD", "2027-03-22", "2027-04-03")
+        self.assertEqual(fs.parse_ss_key(fs.combo_key(rt, "v2_2")), rt)
+        self.assertEqual(fs.parse_ss_key(fs.combo_key(oj, "v2_2")), oj)
+        self.assertIsNone(fs.parse_ss_key("v2_2|garbage"))
+
+    def test_oj_fast_payload_legs(self):
+        payload = fs._ss_fast_payload_legs(
+            [("VIE", "TYO", "2027-04-06"), ("OSA", "BUD", "2027-04-21")], adults=2
+        )
+        self.assertEqual(len(payload["legs"]), 2)
+        self.assertEqual(
+            payload["legs"][0]["legDestination"]["entityId"],
+            fs._SS_ENTITY_IDS["TYO"],
+        )
+        self.assertEqual(
+            payload["legs"][1]["legOrigin"]["entityId"],
+            fs._SS_ENTITY_IDS["OSA"],
+        )
+        # RT payload is unchanged by the generalization
+        rt = fs._ss_fast_payload("BUD", "TYO", "2027-03-22", "2027-04-03", adults=2)
+        self.assertEqual(len(rt["legs"]), 2)
+        self.assertNotIn("placeOfStay", rt["legs"][1])
+        self.assertEqual(
+            rt["legs"][1]["legOrigin"]["entityId"], fs._SS_ENTITY_IDS["TYO"]
+        )
+
+    def test_multicity_url(self):
+        url = fs._ss_multicity_url(
+            [("VIE", "TYO", "2027-04-06"), ("OSA", "BUD", "2027-04-21")],
+            "skyscanner.hu",
+            2,
+        )
+        self.assertIn("skyscanner.hu/transport/flights/multicity", url)
+        self.assertIn("origin0=VIE", url)
+        self.assertIn("destination1=BUD", url)
+        self.assertIn("date0=2027-04-06", url)
+        self.assertIn("date1=2027-04-21", url)
 
 
 class SchedulerTests(unittest.TestCase):
@@ -692,6 +761,7 @@ class SchedulerTests(unittest.TestCase):
             "hot_combos": 1,
             "neighbour_combos": 0,
             "explore_combos": 3,
+            "oj_enabled": False,
             "hot_refresh_hours": 18,
             "explore_refresh_hours": 120,
             "top_deals": 10,
@@ -755,9 +825,7 @@ class SchedulerTests(unittest.TestCase):
                 "HUF",
             ),
         )
-        spotcheck.return_value = [
-            (winner[0], winner[1], winner[2], winner[3], 5, [self._raw_deal()])
-        ]
+        spotcheck.return_value = [("RT", *winner, 5, [self._raw_deal()])]
         args = SimpleNamespace(rank_only=False, no_skyscanner=False)
 
         fs.run_skyscanner_if_due(cfg, conn, args, [])
@@ -771,7 +839,7 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(len(combos), 4)
         self.assertEqual(spotcheck.call_count, 1)
         selected = spotcheck.call_args[0][2]
-        self.assertIn(winner, selected)
+        self.assertIn(("RT", *winner), selected)
         self.assertEqual(len(selected), 4)
         # results persisted
         self.assertEqual(
@@ -801,6 +869,57 @@ class SchedulerTests(unittest.TestCase):
         fs.run_skyscanner_if_due(cfg, conn, args, [])
 
         spotcheck.assert_not_called()
+
+    @patch("flight_search._travelpayouts_cheap_pairs", return_value={})
+    @patch("flight_search.skyscanner_spotcheck")
+    def test_oj_exploration_quota_and_persistence(self, spotcheck, _tp):
+        cfg = self._cfg()
+        cfg["skyscanner"]["oj_enabled"] = True
+        cfg["skyscanner"]["explore_oj_combos"] = 2
+        conn = fs.init_db(":memory:")
+        self.addCleanup(conn.close)
+
+        def fake_spotcheck(_cfg, _conn, combos):
+            out = []
+            for c in combos:
+                deal = self._raw_deal()
+                if c[0] == "OJ":
+                    deal["legs"] = [
+                        {
+                            "from": c[1],
+                            "to": "HND",
+                            "stops": 1,
+                            "dep": f"{c[5]}T10:00",
+                            "dur_min": 1200,
+                            "carriers": ["Airline"],
+                        },
+                        {
+                            "from": "KIX",
+                            "to": c[4],
+                            "stops": 1,
+                            "dep": f"{c[6]}T10:00",
+                            "dur_min": 1200,
+                            "carriers": ["Airline"],
+                        },
+                    ]
+                out.append((*c, 5, [deal]))
+            return out
+
+        spotcheck.side_effect = fake_spotcheck
+        args = SimpleNamespace(rank_only=False, no_skyscanner=False)
+
+        fs.run_skyscanner_if_due(cfg, conn, args, [])
+
+        selected = spotcheck.call_args[0][2]
+        n_oj = sum(1 for c in selected if c[0] == "OJ")
+        self.assertEqual(n_oj, 2)
+        oj_rows = conn.execute(
+            "SELECT key FROM skyscanner_prices WHERE key LIKE 'v2_2|OJ|%'"
+        ).fetchall()
+        self.assertEqual(len(oj_rows), 2)
+        # OJ keys carry all four cities + dates
+        for (k,) in oj_rows:
+            self.assertEqual(len(k.split("|")), 8)
 
 
 class TooLongTests(unittest.TestCase):
@@ -949,17 +1068,7 @@ class RenderTests(unittest.TestCase):
                 },
             ],
         }
-        row = (
-            "BUD",
-            "TYO",
-            "2027-03-22",
-            "2027-04-03",
-            1,
-            json.dumps([deal]),
-            fetched,
-            2,
-            "HUF",
-        )
+        row = ss_row(json.dumps([deal]), fetched)
         itins = fs.build_itineraries(cfg, {}, ss_rows=[row])
         fs.label_itins(itins)
         conn = fs.init_db(":memory:")

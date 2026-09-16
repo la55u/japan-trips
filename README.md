@@ -12,9 +12,10 @@ and return departure dates, it prices:
 
 - **Round trips** — BUD or VIE ↔ Tokyo (TYO) or Osaka (OSA), same city both ways.
 - **Open jaw** — fly into one Japanese city, fly home from the other (one shinkansen ride
-  between cities instead of backtracking). Priced as the sum of two one-ways, with the
-  outbound origin and return destination freely mixable (e.g. out of Vienna, home to
-  Budapest).
+  between cities instead of backtracking). Google prices it as the sum of two one-ways,
+  with the outbound origin and return destination freely mixable (e.g. out of Vienna,
+  home to Budapest); Skyscanner is additionally searched for **true multi-city
+  open-jaw fares** (both legs as one OTA booking).
 
 Each itinerary's **total per-person cost** = airfare + estimated transfers:
 
@@ -32,13 +33,16 @@ estimate, because Skyscanner does not provide a verified bag-inclusive quote.
 
 Skyscanner is spot-checked through an anti-fingerprint browser at most every 3 hours in
 three tiers with per-combination refresh times: **hot** (refresh current winners),
-**neighbours** (±1–3 days around stored deals that beat Google), and **exploration**
+**neighbours** (±1–3 days around stored RT deals that beat Google), and **exploration**
 (unseen pairs first, then oldest checked, balanced across routes and trip durations —
-around 50 pairs/run, a full window sweep in under a week). Rows older than a day are
-labelled *indicative*; the stats strip shows Skyscanner coverage (pairs checked, oldest
-check, estimated full-sweep time). Optionally, a Travelpayouts Data API token
-(`[travelpayouts]`) enables cached calendar prices to prioritize which exploration
-pairs get checked — they are never shown or ranked.
+separate quotas for round trips and multi-city open-jaw searches, a full RT sweep in
+under a week). Open-jaw searches are fast-path only (no SPA deep link); occasional
+PerimeterX 403s right after a session bootstrap are handled by one fresh-session
+retry. Rows older than a day are labelled *indicative*; the stats strip shows
+Skyscanner coverage (pairs checked, oldest check, estimated full-sweep time).
+Optionally, a Travelpayouts Data API token (`[travelpayouts]`) enables cached calendar
+prices to prioritize which exploration pairs get checked — they are never shown or
+ranked.
 
 ## Setup
 
@@ -111,9 +115,10 @@ TTL; parser, transport, and unrecognized-response failures remain due. Fares bey
 
 - **Round-trip page payloads contain outbound details only.** A second selection RPC is
   required for the paired return and can break if Google's private schema changes.
-- **Open jaw = sum of two one-ways**, which slightly overestimates a real multi-city
-  ticket. fast-flights' parser cannot handle Google's multi-city responses. Use the
-  Google Flights links on each row to verify the true multi-city price.
+- **Google open jaw = sum of two one-ways**, which slightly overestimates a real
+  multi-city ticket. fast-flights' parser cannot handle Google's multi-city responses.
+  Use the Google Flights links on each row to verify the true multi-city price;
+  Skyscanner multi-city (Open jaw · OTA) rows price both legs as one OTA booking.
 - Transfer costs are static estimates (`[costs]`); March–May 2027 shinkansen/domestic
   fares aren't bookable yet.
 - “12–16 days” is a departure-date difference, not guaranteed nights in Japan.

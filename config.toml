@@ -27,13 +27,19 @@ enabled = true
 # get checked is decided per-combination from skyscanner_attempts refresh
 # times, not by this global cadence.
 min_age_hours = 3
+# True multi-city (open-jaw) Skyscanner searches: outbound home->in_city,
+# return out_city->home, priced as ONE multi-city query. Adds an OJ universe
+# (~2840 combos) to exploration; OJ rows rank as "Open jaw · OTA".
+oj_enabled = true
 # Tiers per run: hot = refresh stored winners; neighbour = +/-1..3-day shifts
-# around stored deals that beat Google by >100 EUR; exploration = unseen
-# pairs first, then oldest successful check, balanced across routes and trip
-# durations (Travelpayouts calendar pairs, when configured, jump the queue).
+# around stored deals that beat Google by >100 EUR (RT only); exploration =
+# unseen pairs first, then oldest successful check, balanced across routes
+# and trip durations (Travelpayouts calendar pairs, when configured, jump the
+# queue). RT and OJ exploration quotas are separate.
 hot_combos = 15
 neighbour_combos = 10
 explore_combos = 25
+explore_oj_combos = 10
 # Hot winners are refreshed once older than this (hours)...
 hot_refresh_hours = 18
 # ...exploration pairs once older than this (hours; 5 days).

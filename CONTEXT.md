@@ -115,6 +115,12 @@ Other validation errors (e.g. ReturnValidationError) still count as failures.
   per checked pair enter the ranking; airfare=EUR, same transfer model. Agent name +
   Skyscanner page link carried on the row. Rows older than `indicative_after_hours`
   (24) are flagged `indicative`; rows older than `max_age_hours` (168) are dropped.
+  Two row kinds: RT rows (round-trip searches, key `vN_a|origin|dest|d1|d2`) and OJ
+  rows (true multi-city open-jaw searches, key
+  `vN_a|OJ|out_origin|in_city|out_city|home|d1|d2`; `ss_oj` flag on the itinerary,
+  badge "Open jaw · OTA", Skyscanner link = `/transport/flights/multicity?origin0=..`
+  deep link). OJ validation: leg1 out_origin→in_city on d1, leg2 out_city→home on d2,
+  transfers = shinkansen only + FlixBus per VIE endpoint (transfers_for "OJ").
 - Transfers (config `[costs]`): OJ = shinkansen 90; RT = shinkansen + domestic 65;
   FlixBus 15/direction for every leg involving VIE (out_origin or ret_dest).
 - Sort by total = airfare + transfers.
@@ -135,43 +141,50 @@ Other validation errors (e.g. ReturnValidationError) still count as failures.
 - Tiered combo selection (`run_skyscanner_if_due`) driven by PER-COMBO refresh times
   from `skyscanner_attempts.last_success_at` (the global cadence only spaces browser
   sessions); ~50 combos/run in three tiers:
-  1. **hot** (`hot_combos`=15): stored winners (rows with deals) whose last refresh is
-     older than `hot_refresh_hours` (18) — cheapest first. Keeps displayed deals fresh
-     and re-verifies old top deals (a stale top deal stays visible but is labelled
-     "indicative" until refreshed).
-  2. **neighbours** (`neighbour_combos`=10): ±1..3-day date shifts around stored pairs
-     whose best deal beats the Google RT by >100 EUR; candidates already attempted
-     within `explore_refresh_hours` are skipped.
-  3. **exploration** (`explore_combos`=25): every RT combo in the window
-     (`_ss_universe`, same enumeration as the RT part of `plan_queries`, 1140 pairs)
-     that is unseen or not successfully checked within `explore_refresh_hours` (120h);
-     oldest-successful first, round-robin quotas per route (origin,dest) and trip
-     duration (`_select_exploration`). This replaced the old Google-top + RT−OJ
-     gap-discovery heuristics (gap logic kept only in the neighbour tier), because it
-     missed independently cheap Skyscanner dates. The old
-     `skyscanner_discover_cursor` state key is no longer used.
+  1. **hot** (`hot_combos`=15): stored winners (rows with deals, RT and OJ) whose last
+      refresh is older than `hot_refresh_hours` (18) — cheapest first. Keeps displayed
+      deals fresh and re-verifies old top deals (a stale top deal stays visible but is
+      labelled "indicative" until refreshed).
+  2. **neighbours** (`neighbour_combos`=10): ±1..3-day date shifts around stored RT
+      pairs whose best deal beats the Google RT by >100 EUR (RT only — the gap is
+      defined against the Google RT fare map); candidates already attempted
+      within `explore_refresh_hours` are skipped.
+  3. **exploration**: every RT combo in the window (`_ss_universe`, same enumeration
+      as the RT part of `plan_queries`, 1140 pairs, quota `explore_combos`=25) plus
+      every OJ combo (`_ss_oj_universe`: both Japan directions × both origins as
+      departure AND return city × all date pairs, ~2840, quota `explore_oj_combos`=10;
+      `oj_enabled` turns the OJ tier off) that is unseen or not successfully checked
+      within `explore_refresh_hours` (120h); oldest-successful first, round-robin
+      quotas per route and trip duration (`_select_exploration`, shape-agnostic:
+      route = all city segments, dates = trailing pair). Separate RT/OJ quotas so
+      neither universe starves the other.
   - Optional Travelpayouts boost: `_travelpayouts_cheap_pairs` queries the Aviasales
     v3 `prices_for_dates` calendar (cached prices, stdlib urllib, never raises) and
     prioritizes matching exploration pairs within each bucket when
     `[travelpayouts] enabled/token` is set. TP data is never displayed or ranked.
 - Fetch (`skyscanner_spotcheck`): camoufox (anti-fingerprint Firefox, humanize, geoip,
-  locale hu-HU) loads `skyscanner.hu` search URLs (`_ss_url`, dates as YYMMDD, city
-  codes `bud/vie` + `tyoa/osaa`, 2 adults). The fast path captures the SPA's POST
-  headers, replays `web-unified-search` in-page, and polls with the top-level response
-  `context.sessionId`; it re-bootstraps every `fast_rebootstrap` (6) queries. Any
-  fast-path failure falls back to full navigation/XHR capture. PerimeterX challenge =
-  `#px-captcha` press-and-hold solved by `_solve_px`. Responses parse
-  `itineraries.results[]` (price.raw/formatted, isSelfTransfer,
-  isProtectedSelfTransfer, pricingOptions→agents + deep link, legs with
-  origin/destination ids, stopCount, departure/arrival, durationInMinutes, carriers).
+  locale hu-HU). Combos are tagged tuples ("RT", o, d, d1, d2) / ("OJ", oo, ic, oc, h,
+  d1, d2). The fast path POSTs the same `web-unified-search` API for both kinds — an
+  OJ search is just a 2-leg multi-city body (independent leg routes; the API accepts
+  them; validated live 2026-09, e.g. VIE→TYO + OSA→BUD returned 1136 itineraries).
+  RT bootstraps/re-bootstraps navigate the combo's own RT search URL (headers are
+  generic across kinds). The SPA slow path (navigate + XHR capture) is RT-only —
+  OJ has no reliable multi-city deep-link URL for the SPA, so OJ is fast-path only:
+  on failure it re-bootstraps and retries ONCE (fast POSTs fired immediately after a
+  bootstrap are sometimes 403'd by PX), then gives up and the combo stays due.
+  `web-unified-search` results can stream in across poll snapshots — a
+  complete-but-empty response gets up to 5 extra polls (2s apart) before giving up.
   Keeps top `top_deals` (10) cheapest per combo, adds `eur` conversion using an
   explicit configured/response currency (HUF via `huf_per_eur`, GBP via
   `eur_per_gbp`; unknown currencies are rejected). Party totals are divided by adults.
   ~50 combos ≈ 10-20 min incl. re-bootstraps (CI timeout 60 min is still fine).
-- Storage: versioned `skyscanner_prices` keys include adults; rows carry currency and
-  passenger count. `skyscanner_attempts` tracks per-combo attempts, successes, and
-  errors AND is the per-combo refresh timestamp that drives scheduling. A completely
-  failed batch remains immediately due.
+- Storage: versioned `skyscanner_prices` keys include adults; RT keys are
+  `vN_a|origin|dest|d1|d2` (historical format, unchanged), OJ keys
+  `vN_a|OJ|out_origin|in_city|out_city|home|d1|d2` (columns: origin=out_origin,
+  dest=home — middle cities live in the key; `parse_ss_key`/`combo_key` convert).
+  `skyscanner_attempts` uses the same key format and tracks per-combo attempts,
+  successes, and errors AND is the per-combo refresh timestamp that drives
+  scheduling. A completely failed batch remains immediately due.
 - Ranking freshness: stored deals are eligible up to `max_age_hours` (168 = 7 days);
   deals older than `indicative_after_hours` (24) stay visible but are flagged
   "indicative" in the table badge, detail dialog, and foot note (verify before
@@ -181,8 +194,9 @@ Other validation errors (e.g. ReturnValidationError) still count as failures.
   OTA fare is shown separately. Self-transfer, protection, source age, and the bag
   caveat are retained for display.
 - Coverage stats on the page: checked/total pairs (`skyscanner_attempts` successes vs
-  `_ss_universe`), stored rows, oldest successful check, and the estimated full-sweep
-  time (remaining/`explore_combos` × `min_age_hours`).
+  `_ss_universe` + `_ss_oj_universe`), stored rows, oldest successful check, and the
+  estimated full-sweep time (remaining/`explore_combos`+`explore_oj_combos` ×
+  `min_age_hours`).
 - CI validated: works from GitHub datacenter IPs (6-10 combos, ~3 min, no challenges
   needed so far; challenges would be solved automatically). The new ~50-combo run has
   NOT yet been validated in CI — watch the first hourly runs.
@@ -218,7 +232,9 @@ Other validation errors (e.g. ReturnValidationError) still count as failures.
 - `skyscanner_prices(key PK, origin, dest, d1, d2, total_results, deals_json,
   fetched_at, adults, currency)` — deals_json = list of {price_raw, price_fmt, eur,
   self_transfer, protected, agents, legs[{from,to,stops,dep,arr,dur_min,carriers}],
-  link(agent deeplink, stored not rendered)}.
+  link(agent deeplink, stored not rendered)}. RT keys `vN_a|origin|dest|d1|d2`, OJ
+  keys `vN_a|OJ|out_origin|in_city|out_city|home|d1|d2` (origin=out_origin column,
+  dest=home column).
 - `skyscanner_attempts(key PK, last_attempt_at, last_success_at, last_error)` —
   per-combo refresh times; `last_success_at` drives the tiered scheduler.
 - `price_history`, `itinerary_history`, and `runs` use 180-day retention.
@@ -313,16 +329,19 @@ OTA self-transfer combos — that gap is Skyscanner's value-add.
 
 - RT return leg details: real via Select-flight RPC for newly scanned rows; older rows
   fall back to ≈ reference (best one-way same date).
-- OJ price = sum of two one-ways (slight overestimate vs true multi-city ticket).
+- OJ price = sum of two one-ways for Google OJ rows (slight overestimate vs true
+  multi-city ticket). SS OJ rows (Skyscanner multi-city searches) price the whole
+  journey as one OTA booking — the closest to the true price, still OTA caveats.
 - SS prices are OTA fares: separate tickets/self-transfer and agent middlemen. They are
   shown with an OTA badge and caveats; a conservative bag estimate improves but cannot
   guarantee checkout-price comparability.
 - SS EUR conversion: HUF via `huf_per_eur`, GBP via `eur_per_gbp` (static config rates).
 - PerimeterX: camoufox + press-and-hold has passed consistently (local + CI). Volume
   kept moderate (≤50 searches per 3h run; fast requests use 1–2s gaps and navigation
-  fallback uses 5–10s gaps; session re-bootstraps every 6 fast queries). If PX
-  escalates: volume down (tier knobs) or residential proxy (camoufox supports
-  `proxy=`).
+  fallback uses 5–10s gaps; session re-bootstraps every 6 fast queries). OJ fast
+  POSTs right after a bootstrap are sometimes 403'd — handled by the one fresh-session
+  retry. If PX escalates: volume down (tier knobs) or residential proxy (camoufox
+  supports `proxy=`).
 - Month-grid mining ("cheapest month" survey, one request ≈ 60 date pairs) was
   investigated: the month page bounces direct entries to the homepage (needs search
   flow context) — deferred.
@@ -347,6 +366,11 @@ OTA self-transfer combos — that gap is Skyscanner's value-add.
 ## Current status / open threads
 
 - Merged single ranking table with per-row multi-source links: implemented.
+- Skyscanner true multi-city open-jaw searches (OJ universe + tier, fast-path multi-leg
+  payload, OJ ranking/badge/multicity link): implemented and validated LOCALLY
+  (live 4/4 combos incl. VIE→HND+KIX→BUD at ~589 072 Ft/2 adults) — NEEDS CI
+  VALIDATION (watch the first hourly runs; OJ fast-path 403/retry behavior from
+  datacenter IPs).
 - Oldest-first Google scheduling + hourly cron at :23: implemented locally; needs CI
   validation after the two-adult cache migration.
 - Skyscanner tiered scheduler (hot/neighbour/exploration, per-combo refresh times,
@@ -354,7 +378,7 @@ OTA self-transfer combos — that gap is Skyscanner's value-add.
   indicative freshness labelling, coverage stats, source filter, OTA summary card,
   and optional Travelpayouts exploration boost: implemented locally; NEEDS CI
   VALIDATION (no post-migration CI run yet; watch PX behavior at ~50 combos/run).
-- Possible future work: true Skyscanner open-jaw searches, Skyscanner internal
+- Possible future work: Skyscanner internal
   calendar/flexible-date endpoint (one request could shortlist dozens of dates),
   month-grid mining (blocked on PX/flow complexity), residential proxy fallback,
   price_history-based charts, Duffel as a structured validation source.
