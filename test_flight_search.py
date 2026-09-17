@@ -921,6 +921,67 @@ class SchedulerTests(unittest.TestCase):
         for (k,) in oj_rows:
             self.assertEqual(len(k.split("|")), 8)
 
+    @patch("flight_search._travelpayouts_cheap_pairs", return_value={})
+    @patch("flight_search.skyscanner_spotcheck")
+    def test_neighbour_tier_shifts_tagged_rt_combos(self, spotcheck, _tp):
+        cfg = self._cfg()
+        cfg["skyscanner"]["hot_combos"] = 0
+        cfg["skyscanner"]["neighbour_combos"] = 2
+        cfg["skyscanner"]["explore_combos"] = 0
+        # widen the window so +/-1..3-day shifts have room inside it
+        cfg["search"]["date_end"] = "2027-04-10"
+        conn = fs.init_db(":memory:")
+        self.addCleanup(conn.close)
+        # stored RT deal at 100 vs Google RT at 500 -> strong gap -> neighbour
+        conn.execute(
+            """INSERT INTO skyscanner_prices
+               (key, origin, dest, d1, d2, total_results, deals_json,
+                fetched_at, adults, currency)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "v2_2|BUD|TYO|2027-03-22|2027-04-03",
+                "BUD",
+                "TYO",
+                "2027-03-22",
+                "2027-04-03",
+                1,
+                json.dumps([{"eur": 100.0, "agents": ["Agent"]}]),
+                "2026-09-11T00:00:00Z",
+                2,
+                "HUF",
+            ),
+        )
+        google_rt = {
+            "kind": "RT",
+            "out_origin": "BUD",
+            "in_city": "TYO",
+            "out_city": "TYO",
+            "ret_dest": "BUD",
+            "d1": "2027-03-22",
+            "d2": "2027-04-03",
+            "airfare": 500.0,
+        }
+        spotcheck.side_effect = lambda _c, _n, combos: [
+            (*c, 5, [self._raw_deal()]) for c in combos
+        ]
+        args = SimpleNamespace(rank_only=False, no_skyscanner=False)
+
+        fs.run_skyscanner_if_due(cfg, conn, args, [google_rt])
+
+        selected = spotcheck.call_args[0][2]
+        self.assertTrue(selected)
+        for c in selected:
+            self.assertEqual(c[0], "RT")
+            # +/-1..3-day shifts around the stored pair, inside the window
+            d1d = fs.date.fromisoformat(c[3])
+            d2d = fs.date.fromisoformat(c[4])
+            self.assertTrue(
+                fs.date.fromisoformat("2027-03-22")
+                <= d1d
+                < d2d
+                <= fs.date.fromisoformat("2027-04-10")
+            )
+
 
 class TooLongTests(unittest.TestCase):
     def _long_itin(self):

@@ -1206,8 +1206,8 @@ def run_skyscanner_if_due(cfg, conn, args, itins):
     for _gap, r in strong:
         if n_neighbour_taken >= n_neighbour:
             break
-        d1d = date.fromisoformat(r["combo"][2])
-        d2d = date.fromisoformat(r["combo"][3])
+        d1d = date.fromisoformat(r["combo"][3])
+        d2d = date.fromisoformat(r["combo"][4])
         for k in (-3, -2, -1, 1, 2, 3):
             shifted_d1 = d1d + timedelta(days=k)
             shifted_d2 = d2d + timedelta(days=k)
