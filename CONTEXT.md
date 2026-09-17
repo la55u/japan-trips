@@ -367,10 +367,10 @@ OTA self-transfer combos — that gap is Skyscanner's value-add.
 
 - Merged single ranking table with per-row multi-source links: implemented.
 - Skyscanner true multi-city open-jaw searches (OJ universe + tier, fast-path multi-leg
-  payload, OJ ranking/badge/multicity link): implemented and validated LOCALLY
-  (live 4/4 combos incl. VIE→HND+KIX→BUD at ~589 072 Ft/2 adults) — NEEDS CI
-  VALIDATION (watch the first hourly runs; OJ fast-path 403/retry behavior from
-  datacenter IPs).
+  payload, OJ ranking/badge/multicity link): implemented and CI-VALIDATED (2026-09-17:
+  60 combos/run incl. 10 OJ combos stored with deals from datacenter IPs; one PX 412
+  recovered by the fresh-session retry; neighbour-tier tagged-combo date bug found and
+  fixed with regression test).
 - Oldest-first Google scheduling + hourly cron at :23: implemented locally; needs CI
   validation after the two-adult cache migration.
 - Skyscanner tiered scheduler (hot/neighbour/exploration, per-combo refresh times,
