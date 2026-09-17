@@ -136,12 +136,12 @@ Other validation errors (e.g. ReturnValidationError) still count as failures.
 ## Skyscanner pipeline (secondary source)
 
 - Runs inside each hourly job when due: state key `skyscanner_last_run` older than
-  `min_age_hours` (3h). Fully isolated: per-combo try/except + whole-function
+  `min_age_hours` (2h). Fully isolated: per-combo try/except + whole-function
   try/except — a Skyscanner failure can never affect the Google scan or the render.
 - Tiered combo selection (`run_skyscanner_if_due`) driven by PER-COMBO refresh times
   from `skyscanner_attempts.last_success_at` (the global cadence only spaces browser
-  sessions); ~50 combos/run in three tiers:
-  1. **hot** (`hot_combos`=15): stored winners (rows with deals, RT and OJ) whose last
+  sessions); ~80 combos/run in three tiers:
+  1. **hot** (`hot_combos`=20): stored winners (rows with deals, RT and OJ) whose last
       refresh is older than `hot_refresh_hours` (18) — cheapest first. Keeps displayed
       deals fresh and re-verifies old top deals (a stale top deal stays visible but is
       labelled "indicative" until refreshed).
@@ -150,9 +150,9 @@ Other validation errors (e.g. ReturnValidationError) still count as failures.
       defined against the Google RT fare map); candidates already attempted
       within `explore_refresh_hours` are skipped.
   3. **exploration**: every RT combo in the window (`_ss_universe`, same enumeration
-      as the RT part of `plan_queries`, 1140 pairs, quota `explore_combos`=25) plus
+      as the RT part of `plan_queries`, 1140 pairs, quota `explore_combos`=30) plus
       every OJ combo (`_ss_oj_universe`: both Japan directions × both origins as
-      departure AND return city × all date pairs, ~2840, quota `explore_oj_combos`=10;
+      departure AND return city × all date pairs, ~2840, quota `explore_oj_combos`=20;
       `oj_enabled` turns the OJ tier off) that is unseen or not successfully checked
       within `explore_refresh_hours` (120h); oldest-successful first, round-robin
       quotas per route and trip duration (`_select_exploration`, shape-agnostic:
@@ -177,7 +177,7 @@ Other validation errors (e.g. ReturnValidationError) still count as failures.
   Keeps top `top_deals` (10) cheapest per combo, adds `eur` conversion using an
   explicit configured/response currency (HUF via `huf_per_eur`, GBP via
   `eur_per_gbp`; unknown currencies are rejected). Party totals are divided by adults.
-  ~50 combos ≈ 10-20 min incl. re-bootstraps (CI timeout 60 min is still fine).
+  ~80 combos ≈ 20-30 min incl. re-bootstraps (CI timeout 60 min is still fine).
 - Storage: versioned `skyscanner_prices` keys include adults; RT keys are
   `vN_a|origin|dest|d1|d2` (historical format, unchanged), OJ keys
   `vN_a|OJ|out_origin|in_city|out_city|home|d1|d2` (columns: origin=out_origin,
@@ -197,9 +197,10 @@ Other validation errors (e.g. ReturnValidationError) still count as failures.
   `_ss_universe` + `_ss_oj_universe`), stored rows, oldest successful check, and the
   estimated full-sweep time (remaining/`explore_combos`+`explore_oj_combos` ×
   `min_age_hours`).
-- CI validated: works from GitHub datacenter IPs (6-10 combos, ~3 min, no challenges
-  needed so far; challenges would be solved automatically). The new ~50-combo run has
-  NOT yet been validated in CI — watch the first hourly runs.
+- CI validated: works from GitHub datacenter IPs (60-combo runs incl. OJ verified
+  2026-09-17; occasional PX 412/403 recovered by the fresh-session retry). The
+  ~80-combo/2h rate has NOT yet been watched over multiple runs — check the
+  coverage/sweep stats and PX escalation after a day.
 - Skyscanner links on the page point to the Skyscanner search page (`_ss_url`), NOT the
   agent deep link (agent deeplinks are stored but not rendered).
 
@@ -337,7 +338,7 @@ OTA self-transfer combos — that gap is Skyscanner's value-add.
   guarantee checkout-price comparability.
 - SS EUR conversion: HUF via `huf_per_eur`, GBP via `eur_per_gbp` (static config rates).
 - PerimeterX: camoufox + press-and-hold has passed consistently (local + CI). Volume
-  kept moderate (≤50 searches per 3h run; fast requests use 1–2s gaps and navigation
+  kept moderate (≤80 searches per 2h run; fast requests use 1–2s gaps and navigation
   fallback uses 5–10s gaps; session re-bootstraps every 6 fast queries). OJ fast
   POSTs right after a bootstrap are sometimes 403'd — handled by the one fresh-session
   retry. If PX escalates: volume down (tier knobs) or residential proxy (camoufox
@@ -374,10 +375,11 @@ OTA self-transfer combos — that gap is Skyscanner's value-add.
 - Oldest-first Google scheduling + hourly cron at :23: implemented locally; needs CI
   validation after the two-adult cache migration.
 - Skyscanner tiered scheduler (hot/neighbour/exploration, per-combo refresh times,
-  3h cadence), independent SS ranking (no Google match), 5 eligible deals/pair,
+  2h cadence, ~80 combos/run incl. separate OJ quota), independent SS ranking (no
+  Google match), 5 eligible deals/pair,
   indicative freshness labelling, coverage stats, source filter, OTA summary card,
-  and optional Travelpayouts exploration boost: implemented locally; NEEDS CI
-  VALIDATION (no post-migration CI run yet; watch PX behavior at ~50 combos/run).
+  and optional Travelpayouts exploration boost: implemented, CI-validated (see
+  status above).
 - Possible future work: Skyscanner internal
   calendar/flexible-date endpoint (one request could shortlist dozens of dates),
   month-grid mining (blocked on PX/flow complexity), residential proxy fallback,

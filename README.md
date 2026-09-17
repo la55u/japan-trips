@@ -31,7 +31,7 @@ checked bag, and max 2 stops by default. OTA rows are ranked independently of Go
 the table shows both the raw OTA fare and the fare plus a conservative configured bag
 estimate, because Skyscanner does not provide a verified bag-inclusive quote.
 
-Skyscanner is spot-checked through an anti-fingerprint browser at most every 3 hours in
+Skyscanner is spot-checked through an anti-fingerprint browser at most every 2 hours in
 three tiers with per-combination refresh times: **hot** (refresh current winners),
 **neighbours** (±1–3 days around stored RT deals that beat Google), and **exploration**
 (unseen pairs first, then oldest checked, balanced across routes and trip durations —
