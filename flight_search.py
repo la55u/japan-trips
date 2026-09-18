@@ -1963,6 +1963,80 @@ def transfers_for(kind, out_origin, ret_dest, cfg):
     return total, items
 
 
+# --- Baggage fees ------------------------------------------------------------
+# Exact per-airline bag fees instead of a flat estimate. Luggage need: ONE
+# checked bag SHARED between the travellers plus ONE carry-on per person.
+# Google and OTA fares are base fares WITHOUT baggage (verified 2026-09:
+# Google prices are identical with the checked_bags query param at 0 or 1 —
+# the param only filters availability).
+# Fees are online/prepaid rates in EUR: (checked fee per direction for 1 bag,
+# cabin fee per person per direction). 0.0 = included in the cheapest
+# bookable economy fare. Checked once per direction per charging carrier.
+# Sources (checked 2026-09): airline fee charts / ticket-type pages:
+#   Scoot fees chart (20kg pre-purchase ~SGD 65 long-haul sector); Wizz Air
+#   (20kg ~€25-45/sector, cabin trolley needs WIZZ Priority ~€10-20); Cebu
+#   Pacific (intl 20kg prepaid ~PHP 2,000, 7kg cabin incl.); Jeju Air (Basic
+#   fare 0kg, 1st bag USD 45 online, 10kg cabin incl.); Eastar Jet (promo
+#   fare excludes bags, 15kg KRW 30,000); Jetstar (15kg ~¥3,500/sector);
+#   Lufthansa-group Economy Light (1st bag ~€70/route intercontinental);
+#   Finnair Economy Light (1st bag €75-100 prepaid); British Airways Basic
+#   (1st bag ~£60-75/sector); Condor Economy Zero (20kg from €59.99, cabin
+#   8kg from €29.99 — both paid). Unknown carriers are treated as
+#   bag-inclusive (most are full-service with a 23kg allowance).
+BAG_POLICY = {
+    "scoot": (45.0, 0.0),
+    "wizz": (35.0, 15.0),
+    "cebu": (30.0, 0.0),
+    "jeju": (42.0, 0.0),
+    "eastar": (21.0, 0.0),
+    "jetstar": (25.0, 0.0),
+    "lufthansa": (70.0, 0.0),
+    "austrian": (70.0, 0.0),
+    "swiss": (70.0, 0.0),
+    "brussels": (70.0, 0.0),
+    "finnair": (75.0, 0.0),
+    "british airways": (70.0, 0.0),
+    "condor": (60.0, 30.0),
+}
+BAG_UNKNOWN_POLICY = (0.0, 0.0)
+
+
+def _bag_fees(carrier):
+    """(checked EUR/direction, cabin EUR/person/direction) for one carrier."""
+    low = carrier.lower()
+    for frag, fees in BAG_POLICY.items():
+        if frag in low:
+            return fees
+    return BAG_UNKNOWN_POLICY
+
+
+def bag_fees_for_legs(directions, adults):
+    """Compute the exact bag cost for an itinerary.
+
+    directions: list of (label, [carrier names]) — one entry per flight
+    direction (outbound, return). Baggage need: 1 checked bag shared by the
+    party + 1 carry-on per person. Returns (bag_fee_pp, items, all_included)
+    where bag_fee_pp is the per-person EUR cost, items is a list of
+    (label, per-person EUR) for the detail dialog, and all_included is True
+    when every carrier includes both bags in the fare."""
+    checked_party = 0.0
+    cabin_party = 0.0
+    items = []
+    for label, carriers in directions:
+        carriers = carriers or []
+        charging = sorted({c for c in carriers if _bag_fees(c)[0] > 0})
+        # Sum of unique charging carriers (conservative for mixed-carrier
+        # fares; through-ticketed multi-sector journeys usually charge once).
+        for c in charging:
+            fee = _bag_fees(c)[0]
+            checked_party += fee
+            items.append((f"Checked bag · {c} ({label})", fee / adults))
+        for c in sorted({c for c in carriers if _bag_fees(c)[1] > 0}):
+            cabin_party += _bag_fees(c)[1] * adults
+            items.append((f"Cabin bag · {c} ({label})", _bag_fees(c)[1]))
+    return (checked_party + cabin_party) / adults, items, not items
+
+
 def load_rows(conn, cfg):
     rows = {}
     for r in conn.execute(
@@ -2016,7 +2090,6 @@ def _ss_itineraries(cfg, ss_rows):
     max_age = sk_cfg.get("max_age_hours", 168)
     indicative_after = sk_cfg.get("indicative_after_hours", 24)
     eligible_per_pair = sk_cfg.get("eligible_deals", 5)
-    bag_estimate = sk_cfg.get("checked_bag_estimate_eur", 0)
     start = date.fromisoformat(s["date_start"])
     end = date.fromisoformat(s["date_end"])
     oj_city_pairs = {(TYO, OSA), (OSA, TYO)}
@@ -2140,6 +2213,16 @@ def _ss_itineraries(cfg, ss_rows):
                 )
             else:
                 itinerary_key = f"SS|{out_origin}|{in_city}|{d1}|{d2}|{digest}"
+            bag_pp, bag_items, bag_inc = bag_fees_for_legs(
+                [
+                    ("outbound", legs[0].get("carriers") or []),
+                    (
+                        "return",
+                        (legs[1].get("carriers") or []) if len(legs) > 1 else [],
+                    ),
+                ],
+                s.get("adults", 2),
+            )
             out.append(
                 {
                     "key": itinerary_key,
@@ -2151,9 +2234,11 @@ def _ss_itineraries(cfg, ss_rows):
                     "out_city": out_city,
                     "d1": d1,
                     "d2": d2,
-                    "airfare": eur + bag_estimate,
+                    "airfare": eur + bag_pp,
+                    "fare_base": eur,
                     "ota_base_fare": eur,
-                    "bag_estimate": bag_estimate,
+                    "bag_fee_pp": bag_pp,
+                    "bag_items": bag_items,
                     "out_detail": leg_details[0],
                     "ret_detail": leg_details[1],
                     "ret_unavailable": False,
@@ -2163,7 +2248,7 @@ def _ss_itineraries(cfg, ss_rows):
                     "link": deal.get("link"),
                     "self_transfer": bool(deal.get("self_transfer")),
                     "protected": bool(deal.get("protected")),
-                    "bag_included": False,
+                    "bag_included": bag_inc,
                     "indicative": age > indicative_after,
                     "ss_age_hours": round(age, 1),
                     "fetched_at": fetched_at,
@@ -2221,6 +2306,16 @@ def build_itineraries(cfg, rows, ss_rows=None):
                             if ow_ref:
                                 ret_detail = dict(ow_ref)
                                 ret_detail["is_reference"] = True
+                        # Return carriers unknown -> mirror the outbound's
+                        # (same ticket, same airline bag policy).
+                        ret_carriers = (ret_detail or rt).get("airlines") or []
+                        bag_pp, bag_items, _bag_inc = bag_fees_for_legs(
+                            [
+                                ("outbound", rt.get("airlines") or []),
+                                ("return", ret_carriers),
+                            ],
+                            s.get("adults", 2),
+                        )
                         itins.append(
                             {
                                 "key": f"RT|{origin}|{dest}|{d1s}|{d2s}",
@@ -2231,7 +2326,10 @@ def build_itineraries(cfg, rows, ss_rows=None):
                                 "out_city": dest,
                                 "d1": d1s,
                                 "d2": d2s,
-                                "airfare": rt["price"],
+                                "airfare": rt["price"] + bag_pp,
+                                "fare_base": rt["price"],
+                                "bag_fee_pp": bag_pp,
+                                "bag_items": bag_items,
                                 "out_detail": rt,
                                 "ret_detail": ret_detail,
                                 "ret_unavailable": ret_detail is None,
@@ -2253,6 +2351,13 @@ def build_itineraries(cfg, rows, ss_rows=None):
                         if not (allowed(out_leg) and allowed(ret_leg)):
                             continue
                         tr_total, tr_items = transfers_for("OJ", origin, home, cfg)
+                        bag_pp, bag_items, _bag_inc = bag_fees_for_legs(
+                            [
+                                ("outbound", out_leg.get("airlines") or []),
+                                ("return", ret_leg.get("airlines") or []),
+                            ],
+                            s.get("adults", 2),
+                        )
                         itins.append(
                             {
                                 "key": f"OJ|{origin}|{home}|{in_city}|{out_city}|{d1s}|{d2s}",
@@ -2263,7 +2368,10 @@ def build_itineraries(cfg, rows, ss_rows=None):
                                 "out_city": out_city,
                                 "d1": d1s,
                                 "d2": d2s,
-                                "airfare": out_leg["price"] + ret_leg["price"],
+                                "airfare": out_leg["price"] + ret_leg["price"] + bag_pp,
+                                "fare_base": out_leg["price"] + ret_leg["price"],
+                                "bag_fee_pp": bag_pp,
+                                "bag_items": bag_items,
                                 "out_detail": out_leg,
                                 "ret_detail": ret_leg,
                                 "transfers": tr_total,
@@ -2475,21 +2583,30 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
                 f'<br><small class="muted">via {html.escape(it.get("agent", ""))}'
                 f"{suffix}</small>"
             )
-        if it["kind"] == "SS":
+        bag_pp = it.get("bag_fee_pp") or 0
+        fare_base = it.get("fare_base")
+        if fare_base is None:
+            fare_base = it["airfare"] - bag_pp
+        if bag_pp > 0:
             airfare_cell = (
                 f'<td class="num" data-sort-number="{it["airfare"]:.2f}"'
-                f' data-base-fare="{it.get("ota_base_fare") or 0:.2f}">'
+                f' data-base-fare="{fare_base:.2f}">'
                 f'<span data-eur="{it["airfare"]:.0f}">{it["airfare"]:.0f}</span><br>'
-                f'<small title="raw OTA fare plus a conservative checked-bag estimate per person">'
-                f'<span data-eur="{it.get("ota_base_fare") or 0:.0f}">{it.get("ota_base_fare") or 0:.0f}</span>'
-                f' fare + <span data-eur="{it.get("bag_estimate") or 0:.0f}">{it.get("bag_estimate") or 0:.0f}</span> bags</small></td>'
+                f'<small title="base fare plus airline bag fees: 1 shared checked bag '
+                f'+ 1 carry-on per person, per airline published rates">'
+                f'<span data-eur="{fare_base:.0f}">{fare_base:.0f}</span> fare + '
+                f'<span data-eur="{bag_pp:.0f}">{bag_pp:.0f}</span> bags</small></td>'
             )
         else:
-            airfare_cell = f'<td class="num" data-eur="{it["airfare"]:.0f}" data-sort-number="{it["airfare"]:.2f}">{it["airfare"]:.0f}</td>'
+            airfare_cell = (
+                f'<td class="num" data-eur="{it["airfare"]:.0f}" '
+                f'data-sort-number="{it["airfare"]:.2f}" '
+                f'data-base-fare="{fare_base:.2f}">{it["airfare"]:.0f}</td>'
+            )
         rows_html.append(
             f'<tr data-eur-total="{it["total"]:.2f}" data-origin="{html.escape(it["out_origin"])}" '
             f'data-days="{trip_days}" data-kind="{it["kind"]}" data-i="{idx}" title="click for details"'
-            f' data-bag="{it.get("bag_estimate") or 0:.2f}"'
+            f' data-bag="{bag_pp:.2f}"'
             f' data-out-dur="{o.get("dur_h", "") if isinstance(o, dict) else ""}"'
             f' data-ret-dur="{r.get("dur_h", "") if isinstance(r, dict) else ""}">'
             f'<td class="rank">{i}</td><td><span class="{badge_cls}">{kind_label}</span>{agent_html}</td><td>{route_txt}</td>'
@@ -2525,7 +2642,9 @@ def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
                 "ss_age_hours": it.get("ss_age_hours"),
                 "bag_included": it.get("bag_included", True),
                 "ota_base_fare": it.get("ota_base_fare"),
-                "bag_estimate": it.get("bag_estimate"),
+                "fare_base": it.get("fare_base", it["airfare"]),
+                "bag_fee_pp": bag_pp,
+                "bag_items": it.get("bag_items") or [],
                 "fetched_at": it.get("fetched_at"),
             }
         )
@@ -2825,7 +2944,7 @@ TEMPLATE = """<!doctype html>
      <input id="filter-leg-max" type="number" min="1" step="1" value="__MAX_LEG_FILTER__" aria-label="Maximum single-leg duration in hours">
     </label>
     <label class="filter check">Bag fees
-     <input id="filter-bags" type="checkbox" checked aria-label="Include estimated bag fees for OTA fares">
+     <input id="filter-bags" type="checkbox" checked aria-label="Include airline bag fees (1 shared checked bag, 1 carry-on pp)">
     </label>
     <label class="filter">Trip days
      <span class="day-range">
@@ -2860,14 +2979,18 @@ __ROWS__
   <details class="foot-details">
    <summary>About the data &amp; how to read the table</summary>
    <p class="foot">Prices per person from __ADULTS__-adult queries, max __MAX_STOPS__ stops.
-  Google fares request one checked bag. Skyscanner/OTA fares are ranked independently of
-  Google: the airfare column shows the raw OTA fare plus a conservative configured
-  checked-bag estimate (hover for the breakdown). Rows marked <i>indicative</i> were
-  last checked more than a day ago — re-verify via the Skyscanner link before booking.
-  The <i>Max leg h</i> filter (default 24) hides rows where any single leg is longer —
-  raise it to uncover cheaper but slower OTA itineraries (durations turn red above 24h).
-   Untick <i>Bag fees</i> to compare OTA fares without the estimated checked-bag cost —
-   summary cards and Google rows always include everything.
+   Google and OTA fares are <b>base fares without baggage</b> (Google returns the same
+   prices with or without the checked-bag filter — verified). Bag fees are therefore added
+   per airline, from each carrier's published online rates, for the actual need:
+   <b>1 checked bag shared between the 2 travellers + 1 carry-on per person</b>, charged
+   per direction (e.g. Scoot €45, Finnair Light €75, Lufthansa-group Light €70, Condor
+   Zero €60 + €30 cabin pp; full-service Asian carriers include both bags). Rates checked
+   Sep 2026 — verify the exact amount at booking. Rows marked <i>indicative</i> were
+   last checked more than a day ago — re-verify via the Skyscanner link before booking.
+   The <i>Max leg h</i> filter (default 24) hides rows where any single leg is longer —
+   raise it to uncover cheaper but slower OTA itineraries (durations turn red above 24h).
+    Untick <i>Bag fees</i> to compare base fares without the airline bag fees —
+    the detail dialog itemizes the fees per airline and direction.
    Open jaw = sum of two one-ways (verify the true multi-city price via the GF links).
    <i>Open jaw · OTA</i> rows come from true Skyscanner multi-city searches (single
    OTA booking for both legs) — still OTA fares with the same caveats.
@@ -2976,8 +3099,9 @@ function setCur(c) { cur = c; apply(); }
 let includeBags = true;
 function setBags(include) {
   includeBags = include;
-  document.querySelectorAll('#tbl tbody tr[data-kind="SS"]').forEach(tr => {
+  document.querySelectorAll('#tbl tbody tr[data-bag]').forEach(tr => {
     const bag = parseFloat(tr.dataset.bag || '0') || 0;
+    if (!bag) return;
     const fareTd = tr.children[8], totalTd = tr.children[10];
     const base = parseFloat(fareTd.dataset.baseFare || '0') || 0;
     const transfers = parseFloat(totalTd.dataset.transfers || '0') || 0;
@@ -3046,23 +3170,27 @@ function showDetails(it) {
       ? `<span class="delta-chip down">▼ ${fmt(Math.abs(diff)).trim()} cheaper</span>`
       : `<span class="delta-chip up">▲ ${fmt(diff).trim()} more</span>`;
   }
-  const bagOff = !includeBags && it.bag_estimate != null && !it.bag_included;
+  const bagOff = !includeBags && (it.bag_fee_pp || 0) > 0;
+  const bagLines = (it.bag_items || []).map(([n, v]) => [esc(n), fmt(v)]);
   const rows = [
     ...(it.ota_base_fare != null
-      ? (bagOff
-          ? [['OTA base fare (bag fees excluded)', fmt(it.ota_base_fare)]]
-          : [['OTA base fare', fmt(it.ota_base_fare)], ['Estimated checked bag', fmt(it.bag_estimate)]])
-      : [['Airfare', fmt(it.airfare)]]),
+      ? [['OTA base fare', fmt(it.ota_base_fare)]]
+      : [['Airfare (base fare)', fmt(it.fare_base != null ? it.fare_base : it.airfare)]]),
+    ...(bagOff ? [['Bag fees (excluded by toggle)', '—']] : bagLines),
     ...it.transfer_items.map(([n, v]) => [esc(n), fmt(v)]),
   ];
-  const grand = bagOff ? it.total - it.bag_estimate : it.total;
+  const grand = bagOff ? it.total - it.bag_fee_pp : it.total;
   const costs = rows.map(([n, v]) =>
     `<tr><td>${n}</td><td>${v}</td></tr>`).join('');
   const links = it.gf_links
     .map(([name, u]) => `<a href="${u}" target="_blank" rel="noopener">${esc(name)}</a>`)
     .join('');
-  const otaNote = !it.bag_included
-    ? `<div class="dlg-leg"><b>OTA caveat:</b> the checked-bag amount is an estimate, not a verified quote.` +
+  const bagNote = (it.bag_items || []).length
+    ? `<div class="dlg-leg"><b>Bag fees:</b> computed from each airline's published online rates
+       for 1 shared checked bag + 1 carry-on per person &mdash; not a verified quote; verify at booking.</div>`
+    : '';
+  const otaNote = it.ota_base_fare != null
+    ? `<div class="dlg-leg"><b>OTA caveat:</b> this is an agent fare (separate tickets / self-transfer).` +
       `${it.self_transfer ? ' This is a self-transfer itinerary.' : ''}` +
       `${it.protected ? ' The provider marks the transfer as protected.' : ''}` +
       `${it.indicative ? ' <b>Indicative:</b> this pair was last checked ' +
@@ -3073,6 +3201,7 @@ function showDetails(it) {
     <div class="dlg-dates">${fdate(it.d1)} → ${fdate(it.d2)} · ${it.days} days · price per person</div>
     ${legHtml(it.out, 'Outbound')}
     ${legHtml(it.ret, 'Return', it.ret_unavailable)}
+    ${bagNote}
     ${otaNote}
     <table class="dlg-costs">
       ${costs}

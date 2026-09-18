@@ -5,7 +5,8 @@
 Scan Google Flights (and Skyscanner as a secondary source) for cheap round-trip and
 open-jaw flights from Budapest (BUD) and Vienna (VIE) to Tokyo (TYO) and Osaka (OSA),
 for a 12–16 day trip between 2027-03-22 and 2027-05-31, for 2 people (prices per person,
-2-adult queries divided by two, economy, 1 checked bag, max 2 stops). The 12–16 days
+2-adult queries divided by two, economy, max 2 stops; bag fees are computed exactly per
+airline at ranking time — see Ranking). The 12–16 days
 means the difference between outbound and return departure dates, not nights in Japan.
 Results are ranked by total
 per-person cost (airfare + estimated in-Japan transfers + FlixBus to Vienna if used) and
@@ -123,6 +124,21 @@ Other validation errors (e.g. ReturnValidationError) still count as failures.
   transfers = shinkansen only + FlixBus per VIE endpoint (transfers_for "OJ").
 - Transfers (config `[costs]`): OJ = shinkansen 90; RT = shinkansen + domestic 65;
   FlixBus 15/direction for every leg involving VIE (out_origin or ret_dest).
+- Bag fees (exact, per airline): all fares (Google AND OTA) are base fares WITHOUT
+  baggage — verified 2026-09 that Google returns identical prices with the
+  `checked_bags` query param at 0 or 1 (the param only filters availability; keep it
+  at 1 to prefer bag-compatible itineraries). `bag_fees_for_legs` adds the cost of
+  1 checked bag SHARED between the travellers + 1 carry-on per person, per direction
+  (outbound/return), from `BAG_POLICY` in flight_search.py (published online/prepaid
+  rates, checked 2026-09): Scoot 45, Wizz 35+15 cabin pp, Cebu 30, Jeju 42, Eastar 21,
+  Jetstar 25, Lufthansa/Austrian/SWISS/Brussels 70 (Light), Finnair 75 (Light), BA 70
+  (Basic), Condor 60+30 cabin pp (Zero); unknown carriers and all other airlines are
+  treated as bag-inclusive (full-service 23kg). Multi-carrier legs sum the unique
+  fee-charging carriers (accurate for self-transfers, conservative for through-tickets).
+  Row fields: `fare_base`, `bag_fee_pp` (per person), `bag_items` (dialog itemization),
+  `bag_included` (True when nothing is charged). GF RT rows with unknown return
+  carriers mirror the outbound's policy. The Bag fees toggle rewrites ALL rows'
+  airfare/total to the base fare (not just SS).
 - Sort by total = airfare + transfers.
 - RT rows return to their European origin; VIE RT therefore incurs two FlixBus legs.
 - Itinerary keys are asserted unique. OJ generation is independent of the RT
@@ -189,10 +205,10 @@ Other validation errors (e.g. ReturnValidationError) still count as failures.
   deals older than `indicative_after_hours` (24) stay visible but are flagged
   "indicative" in the table badge, detail dialog, and foot note (verify before
   booking). Up to `eligible_deals` (5) unique valid deals per pair are accepted.
-  Route/legs/dates, stop, and duration limits are still validated per deal. A
-  configured EUR 120 checked-bag estimate is added per person for ranking; the raw
-  OTA fare is shown separately. Self-transfer, protection, source age, and the bag
-  caveat are retained for display.
+Route/legs/dates, stop, and duration limits are still validated per deal. Exact
+   per-airline bag fees (1 shared checked bag + 1 carry-on pp, see Bag fees under
+   Ranking) are added to the raw OTA fare; the base fare is shown separately.
+   Self-transfer, protection, source age, and bag caveats are retained for display.
 - Coverage stats on the page: checked/total pairs (`skyscanner_attempts` successes vs
   `_ss_universe` + `_ss_oj_universe`), stored rows, oldest successful check, and the
   estimated full-sweep time (remaining/`explore_combos`+`explore_oj_combos` ×
@@ -251,13 +267,14 @@ table (RT/OJ/SS mixed, sorted by total):
 columns # / Type (badge; SS rows add "via <agent>", plus a bold "indicative, checked
 Xh ago" note when stale) / Route / Outbound / Return / Days / Outbound leg / Return leg
 (RT: real paired return when available, else ≈ reference from best one-way; SS: legs
-from Skyscanner data) / Airfare (SS rows show the bag-normalized total plus a
-"raw fare + bags" breakdown underneath) / Transfers / Total / Δ (vs previous run via
+from Skyscanner data) / Airfare (rows with bag fees show the bag-normalized total plus a
+"fare + bags" breakdown underneath) / Transfers / Total / Δ (vs previous run via
 itinerary_history) / Links (last column: ALL sources — Google GF link, + OJ second GF
 link, + Skyscanner page link for SS rows).
 Dialog (native `<dialog>`): full row details — airport names, times, durations
 (color-coded ≤20h green / ≤24h amber / >24h red — same in table), itemized costs one
-per line (SS rows itemize OTA base fare and bag estimate), all booking links.
+per line (base fare, per-airline/direction bag items when charged, transfers), all
+booking links.
 EUR/HUF toggle (huf_per_eur), sortable headers with ▲▼ indicator (default sort: Total
 asc). Stats strip: prices tracked (by kind), date pairs checked/planned,
 newest/stalest cache age, history points, runs, this-run counts, plus Skyscanner
@@ -266,9 +283,9 @@ Client-side filters: departure city, source (All / Google RT+OJ / OTA Skyscanner
 max leg hours (default `[ranking].max_leg_filter_hours` = 24; hides rows whose
 outbound OR return leg duration exceeds it — raise it to surface the cheap
 long-leg OTA rows stored up to `max_leg_hours_display`), a Bag fees checkbox
-(default on; unticking rewrites SS rows' airfare/total to the raw OTA fare via
-`data-base-fare`/`data-bag`/`data-transfers` and re-sorts — cards and Google rows
-are unaffected, and the detail dialog follows the toggle), and a min/max trip-day
+(default on; unticking rewrites ANY row with bag fees to the base fare via
+`data-base-fare`/`data-bag`/`data-transfers` and re-sorts — the detail dialog
+follows the toggle), and a min/max trip-day
 range. Rows carry `data-out-dur`/`data-ret-dur` for the filter; legs without a
 known duration always pass. Summary cards are computed from the UNFILTERED
 ranking (they can disagree with the first visible row when filters hide rows).
@@ -345,8 +362,8 @@ OTA self-transfer combos — that gap is Skyscanner's value-add.
   multi-city ticket). SS OJ rows (Skyscanner multi-city searches) price the whole
   journey as one OTA booking — the closest to the true price, still OTA caveats.
 - SS prices are OTA fares: separate tickets/self-transfer and agent middlemen. They are
-  shown with an OTA badge and caveats; a conservative bag estimate improves but cannot
-  guarantee checkout-price comparability.
+  shown with an OTA badge and caveats; bag fees are computed from published airline
+  rates but the final checkout price and agent reliability still require verification.
 - SS EUR conversion: HUF via `huf_per_eur`, GBP via `eur_per_gbp` (static config rates).
 - PerimeterX: camoufox + press-and-hold has passed consistently (local + CI). Volume
   kept moderate (≤80 searches per 2h run; fast requests use 1–2s gaps and navigation
@@ -377,6 +394,10 @@ OTA self-transfer combos — that gap is Skyscanner's value-add.
 
 ## Current status / open threads
 
+- Exact per-airline bag fees (replacing the flat 120/person estimate): implemented
+  2026-09 — BAG_POLICY table + bag_fees_for_legs, applied to ALL row kinds (Google
+  prices verified identical with checked_bags 0/1, so fares are base fares everywhere);
+  bag itemization in the dialog; Bag fees toggle applies to every row.
 - Merged single ranking table with per-row multi-source links: implemented.
 - Skyscanner true multi-city open-jaw searches (OJ universe + tier, fast-path multi-leg
   payload, OJ ranking/badge/multicity link): implemented and CI-VALIDATED (2026-09-17:

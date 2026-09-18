@@ -7,6 +7,10 @@ date_end = "2027-05-31"
 trip_min_days = 12
 trip_max_days = 16
 max_stops = 2
+# Google Flights query parameter. NOTE: this only filters availability — Google
+# returns identical prices with or without it (verified 2026-09), so bag fees
+# are NOT baked into any fetched fare. Ranking adds exact per-airline fees for
+# 1 shared checked bag + 1 carry-on per person (BAG_POLICY in flight_search.py).
 checked_bags = 1
 adults = 2
 step_days = 1
@@ -55,9 +59,6 @@ max_age_hours = 168
 # Re-bootstrap the browser session every N fast in-page API queries.
 fast_rebootstrap = 6
 currency = "HUF"
-# Conservative round-trip checked-bag allowance added per person before OTA
-# fares enter the merged ranking (raw fare also shown separately).
-checked_bag_estimate_eur = 120
 
 # Optional discovery booster: Travelpayouts Data API (cached calendar prices).
 # Used ONLY to prioritize which Skyscanner exploration pairs get checked —

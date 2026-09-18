@@ -58,6 +58,50 @@ def detail(route, hours=18):
     }
 
 
+class BagFeeTests(unittest.TestCase):
+    def test_unknown_carrier_is_treated_as_bag_inclusive(self):
+        pp, items, included = fs.bag_fees_for_legs(
+            [("outbound", ["Airline"]), ("return", ["Airline"])], 2
+        )
+        self.assertEqual(pp, 0)
+        self.assertEqual(items, [])
+        self.assertTrue(included)
+
+    def test_checked_fee_is_one_shared_bag_over_the_party(self):
+        pp, items, included = fs.bag_fees_for_legs(
+            [("outbound", ["Scoot"]), ("return", ["Scoot"])], 2
+        )
+        # 2 directions x EUR 45 for one shared bag, split over 2 adults
+        self.assertAlmostEqual(pp, 45.0)
+        self.assertFalse(included)
+        self.assertEqual(
+            [n for n, _ in items],
+            ["Checked bag · Scoot (outbound)", "Checked bag · Scoot (return)"],
+        )
+
+    def test_cabin_fee_is_charged_per_person(self):
+        pp, items, _ = fs.bag_fees_for_legs(
+            [("outbound", ["Wizz Air"]), ("return", [])], 2
+        )
+        self.assertAlmostEqual(pp, (35.0 + 2 * 15.0) / 2)
+        self.assertIn(("Cabin bag · Wizz Air (outbound)", 15.0), items)
+
+    def test_name_normalization_matches_ota_and_gf_names(self):
+        self.assertEqual(fs._bag_fees("ANA (All Nippon Airways)"), (0.0, 0.0))
+        self.assertEqual(fs._bag_fees("Austrian Airlines"), (70.0, 0.0))
+        self.assertEqual(fs._bag_fees("Lufthansa City Airlines"), (70.0, 0.0))
+        self.assertEqual(fs._bag_fees("Jetstar Japan"), (25.0, 0.0))
+        self.assertEqual(fs._bag_fees("SWISS"), (70.0, 0.0))
+        self.assertEqual(fs._bag_fees("Korean Air"), (0.0, 0.0))
+
+    def test_mixed_carriers_sum_the_unique_charging_ones(self):
+        pp, items, _ = fs.bag_fees_for_legs(
+            [("outbound", ["Lufthansa", "ANA", "Scoot", "Lufthansa"])], 2
+        )
+        self.assertAlmostEqual(pp, (70.0 + 45.0) / 2)
+        self.assertEqual(len(items), 2)
+
+
 def ss_row(
     deals_json,
     fetched_at,
@@ -338,7 +382,7 @@ class SkyscannerTests(unittest.TestCase):
         second = fs._ss_itineraries(cfg, [second_row])
 
         self.assertEqual(first[0]["key"], second[0]["key"])
-        self.assertFalse(first[0]["bag_included"])
+        self.assertTrue(first[0]["bag_included"])
         self.assertTrue(first[0]["self_transfer"])
 
     def test_over_stop_limit_is_excluded(self):
@@ -416,11 +460,10 @@ class SkyscannerTests(unittest.TestCase):
 
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["ota_base_fare"], 300)
-        self.assertEqual(result[0]["bag_estimate"], 0)
+        self.assertEqual(result[0]["bag_fee_pp"], 0)
 
     def test_up_to_five_unique_deals_per_pair_are_accepted(self):
         cfg = config()
-        cfg["skyscanner"]["checked_bag_estimate_eur"] = 0
         fetched = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         deals = []
         for i in range(6):
@@ -492,7 +535,6 @@ class SkyscannerTests(unittest.TestCase):
 
     def test_deal_cheaper_than_google_is_not_required_anymore(self):
         cfg = config()
-        cfg["skyscanner"]["checked_bag_estimate_eur"] = 0
         fetched = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         deal = {
             "eur": 600,
@@ -641,7 +683,6 @@ class SkyscannerTests(unittest.TestCase):
 
     def test_open_jaw_deal_is_ranked_as_oj(self):
         cfg = config()
-        cfg["skyscanner"]["checked_bag_estimate_eur"] = 0
         fetched = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         deal = {
             "eur": 400,
@@ -777,7 +818,6 @@ class SchedulerTests(unittest.TestCase):
             "max_age_hours": 168,
             "indicative_after_hours": 24,
             "currency": "HUF",
-            "checked_bag_estimate_eur": 120,
             "domain": "skyscanner.hu",
         }
         return cfg
@@ -1110,7 +1150,6 @@ class RenderTests(unittest.TestCase):
             "max_age_hours": 168,
             "indicative_after_hours": 24,
             "eligible_deals": 5,
-            "checked_bag_estimate_eur": 30,
             "currency": "HUF",
         }
         # ~60h old -> inside the indicative window (24h < age <= max_age 168h)
@@ -1129,6 +1168,7 @@ class RenderTests(unittest.TestCase):
                     "dep": "2027-03-22T10:00",
                     "arr": "2027-03-23T10:00",
                     "dur_min": 1200,
+                    "carriers": ["Scoot"],
                 },
                 {
                     "from": "HND",
@@ -1137,6 +1177,7 @@ class RenderTests(unittest.TestCase):
                     "dep": "2027-04-03T10:00",
                     "arr": "2027-04-03T20:00",
                     "dur_min": 1200,
+                    "carriers": ["Scoot"],
                 },
             ],
         }
@@ -1161,12 +1202,16 @@ class RenderTests(unittest.TestCase):
         self.assertIn('id="filter-bags"', rendered)
         self.assertRegex(rendered, r'data-out-dur="20\.0"')
         self.assertRegex(rendered, r'data-ret-dur="20\.0"')
-        self.assertRegex(rendered, r'data-bag="30\.00"')
+        # Scoot: EUR 45 checked fee per direction, 1 shared bag over 2 adults
+        self.assertRegex(rendered, r'data-bag="45\.00"')
         self.assertRegex(rendered, r'data-base-fare="300\.00"')
         self.assertIn(
-            '<span data-eur="300">300</span> fare + <span data-eur="30">30</span> bags',
+            '<span data-eur="300">300</span> fare + <span data-eur="45">45</span> bags',
             rendered,
         )
+        self.assertIn("Checked bag · Scoot (outbound)", rendered)
+        self.assertIn("Checked bag · Scoot (return)", rendered)
+        self.assertRegex(rendered, r'data-sort-number="345\.00"')
         self.assertEqual(
             [it["kind"] for it in itins],
             ["SS"],

@@ -26,10 +26,15 @@ Each itinerary's **total per-person cost** = airfare + estimated transfers:
 | FlixBus Budapest↔Vienna | €15/direction | every leg involving Vienna |
 
 Everything lives in `config.toml`. Google and Skyscanner are queried for **2 adults**;
-party totals are divided to show per-person prices. Google requests economy, one
-checked bag, and max 2 stops by default. OTA rows are ranked independently of Google:
-the table shows both the raw OTA fare and the fare plus a conservative configured bag
-estimate, because Skyscanner does not provide a verified bag-inclusive quote.
+party totals are divided to show per-person prices. Google requests economy and max
+2 stops by default. All displayed fares are **base fares without baggage** (Google
+returns identical prices with or without its checked-bag filter — verified), so exact
+per-airline bag fees are added at ranking time for the actual need: **1 checked bag
+shared between the two travellers + 1 carry-on per person**, charged per direction
+from each airline's published online rates (e.g. Scoot €45, Finnair Light €75,
+Lufthansa-group Light €70 per direction; full-service Asian carriers include both
+bags). The detail dialog itemizes the fees per airline and direction; the *Bag fees*
+toggle compares raw fares. OTA rows are ranked independently of Google.
 
 Skyscanner is spot-checked through an anti-fingerprint browser at most every 2 hours in
 three tiers with per-combination refresh times: **hot** (refresh current winners),
@@ -122,8 +127,11 @@ TTL; parser, transport, and unrecognized-response failures remain due. Fares bey
 - Transfer costs are static estimates (`[costs]`); March–May 2027 shinkansen/domestic
   fares aren't bookable yet.
 - “12–16 days” is a departure-date difference, not guaranteed nights in Japan.
-- OTA baggage is an estimate; self-transfer/protection and source freshness are shown,
-  but final checkout price and agent reliability still require verification.
+- Bag fees use published airline online rates (see `BAG_POLICY` in `flight_search.py`),
+  applied per direction; multi-sector mixed-carrier legs charge every unique fee-charging
+  carrier once (conservative for through-tickets, accurate for self-transfers). Fare
+  families are inferred from the cheapest bookable fare; the exact checkout price and
+  agent reliability still require verification.
 - Scraping Google Flights is unofficial and may break if the page structure changes.
 
 ## Automation (GitHub Actions)
