@@ -301,7 +301,9 @@ rebase conflict at the commit step, so this polls as defense in depth) →
 `index.html` + `flights.db`
 as github-actions[bot] with pull --rebase; conflicts fail visibly rather than silently
 discarding a completed scan → push (Pages redeploys automatically).
-Concurrency group `scan` (serial). timeout-minutes 60. Rate config: TTL 4h, 450/run
+Concurrency group `scan` (serial). timeout-minutes 120 (raised from 60 after a
+post-outage recovery run — full 450-query Google phase + 80 Skyscanner spot-checks —
+was killed at the 60 min cap with 5 combos remaining). Rate config: TTL 4h, 450/run
 hourly → full window (1708 queries) targets a ~4h refresh. Oldest stale rows are always
 selected first and the report distinguishes fresh from deferred stale work. The shared
 gate enforces ~2 HTTP requests/s across workers and real cooldowns block workers.
