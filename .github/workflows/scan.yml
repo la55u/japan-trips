@@ -27,11 +27,6 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Verify code
-        run: |
-          python -m ruff check flight_search.py watchdog.py test_flight_search.py test_watchdog.py
-          python -m unittest -v
-
       - name: Fetch camoufox browser
         run: python -m camoufox fetch
 

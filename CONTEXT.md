@@ -279,11 +279,20 @@ Summary cards: cheapest overall / round trip / open jaw / OTA (Skyscanner).
 Charts (Chart.js CDN): per-itinerary totals over runs (top history_top_n), cheapest
 overall per run.
 
-## CI workflow (scan.yml)
+## CI workflows
+
+### verify.yml
+
+Runs Ruff + unittest on push to `main` and on pull requests (setup-python@v7, 3.14,
+pip cache). This is the lint/test gate; it is deliberately separate from the scan so a
+broken commit fails verification without halting the hourly scans — the scan keeps
+running the committed code even while `verify` is red.
+
+### scan.yml
 
 Hourly at :23 (off-peak — top-of-hour crons get skipped by GitHub's scheduler; observed
 overnight blackout with `0 * * * *`). Steps: checkout@v7 → setup-python@v7 (3.14) →
-pip install → Ruff + unittest → `python -m camoufox fetch` → wait-for-idle
+pip install → `python -m camoufox fetch` → wait-for-idle
 (polls `gh run list` up to 40 min for other in-progress scan runs with startup
 jitter; GitHub's `concurrency: scan` group once failed to serialize a
 watchdog-dispatch + cron overlap and the loser died on a binary `flights.db`

@@ -2,7 +2,7 @@ import json
 import sqlite3
 import unittest
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -474,13 +474,21 @@ class SkyscannerTests(unittest.TestCase):
                 },
             ],
         }
-        row = ss_row(json.dumps([deal]), "2026-09-11T00:00:00Z")
+        # ~96h old -> inside the indicative window (24h < age <= max_age 168h)
+        fetched = (datetime.now(timezone.utc) - timedelta(hours=96)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        row = ss_row(json.dumps([deal]), fetched)
         result = fs._ss_itineraries(cfg, [row])
         self.assertEqual(len(result), 1)
         self.assertTrue(result[0]["indicative"])
 
-        expired = ss_row(json.dumps([deal]), "2026-05-01T00:00:00Z")
-        self.assertEqual(fs._ss_itineraries(cfg, [expired]), [])
+        # older than max_age_hours -> dropped
+        expired = (datetime.now(timezone.utc) - timedelta(hours=200)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        expired_row = ss_row(json.dumps([deal]), expired)
+        self.assertEqual(fs._ss_itineraries(cfg, [expired_row]), [])
 
     def test_deal_cheaper_than_google_is_not_required_anymore(self):
         cfg = config()
@@ -1105,7 +1113,10 @@ class RenderTests(unittest.TestCase):
             "checked_bag_estimate_eur": 30,
             "currency": "HUF",
         }
-        fetched = "2026-09-11T00:00:00Z"  # ~60h old -> indicative
+        # ~60h old -> inside the indicative window (24h < age <= max_age 168h)
+        fetched = (datetime.now(timezone.utc) - timedelta(hours=60)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
         deal = {
             "eur": 300,
             "agents": ["Agent"],

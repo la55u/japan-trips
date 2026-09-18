@@ -132,7 +132,9 @@ The `.github/workflows/scan.yml` workflow targets hourly execution, although Git
 delay or skip scheduled jobs. Each run fetches the 450 oldest stale queries
 (`--limit 450 --db flights.db`, cache TTL 4 h), targeting a full refresh in roughly
 four runs. The page reports actual freshness and deferred stale work instead of
-claiming a guaranteed four-hour age. Ruff and unit tests run before scanning. After
+claiming a guaranteed four-hour age. Ruff and unit tests run in a separate
+`verify` workflow (push/PR); the scan workflow runs unconditionally so a failing
+test suite never halts the hourly scans. After
 scanning, the workflow commits `index.html` and `flights.db` back to `main`, and
 GitHub Pages redeploys automatically. `flights.db` is committed so price history and
 deltas accumulate across runs; it is written **only by CI** (see "Local vs CI data").
