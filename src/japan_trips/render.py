@@ -17,7 +17,8 @@ from .skyscanner import _ss_multicity_url, _ss_oj_universe, _ss_universe, _ss_ur
 
 
 def fmt_date(iso):
-    return date.fromisoformat(iso).strftime("%a %d %b %Y")
+    # The scan window never crosses years — keep table dates compact.
+    return date.fromisoformat(iso).strftime("%a %d %b")
 
 
 def render_html(cfg, itins, prev, prev_ts, run_ts, conn, args, progress):
@@ -550,6 +551,9 @@ TEMPLATE = """<!doctype html>
     <label class="filter check">Bag fees
      <input id="filter-bags" type="checkbox" checked aria-label="Include airline bag fees (1 shared checked bag, 1 carry-on pp)">
     </label>
+    <label class="filter check">Transfers
+     <input id="filter-transfers" type="checkbox" checked aria-label="Include transfer costs (shinkansen, domestic flight, FlixBus)">
+    </label>
     <label class="filter">Trip days
      <span class="day-range">
       <input id="filter-days-min" type="number" min="__MIN_DAYS__" max="__MAX_DAYS__" value="__MIN_DAYS__" aria-label="Minimum trip days">
@@ -602,9 +606,10 @@ __ROWS__
   For round trips the return leg is the actual flight paired with the shown outbound when
   available (fetched via Google's selection API), otherwise a <i>reference</i> (the best
   one-way on the same date, marked &asymp;) &mdash; verify via the GF links.
-  Transfers are config estimates, added per person: open jaw = shinkansen;
-  round trip = shinkansen + domestic flight; FlixBus per Vienna leg
-  (shinkansen €90, domestic flight €65, FlixBus €15/direction). &Delta; vs previous run. Airport codes carry full names
+   Transfers are config estimates, added per person: open jaw = shinkansen;
+   round trip = shinkansen + domestic flight; FlixBus per Vienna leg
+   (shinkansen €90, domestic flight €65, FlixBus €15/direction) — untick
+   <i>Transfers</i> to compare fares without them. &Delta; vs previous run. Airport codes carry full names
   on hover &mdash; or click any row for a detail card.</p>
   </details>
   <div class="charts">
@@ -700,27 +705,35 @@ function sortBy(th) {
   redrawSort();
 }
 function setCur(c) { cur = c; apply(); }
-let includeBags = true;
-function setBags(include) {
-  includeBags = include;
-  document.querySelectorAll('#tbl tbody tr[data-bag]').forEach(tr => {
-    const bag = parseFloat(tr.dataset.bag || '0') || 0;
-    if (!bag) return;
+let includeBags = true, includeTransfers = true;
+function recalc() {
+  includeBags = document.getElementById('filter-bags').checked;
+  includeTransfers = document.getElementById('filter-transfers').checked;
+  const tbl = document.getElementById('tbl');
+  tbl.classList.toggle('no-bags', !includeBags);
+  tbl.classList.toggle('no-transfers', !includeTransfers);
+  document.querySelectorAll('#tbl tbody tr').forEach(tr => {
     const fareTd = tr.children[8], totalTd = tr.children[10];
+    if (!fareTd || !totalTd) return;
     const base = parseFloat(fareTd.dataset.baseFare || '0') || 0;
+    const bag = parseFloat(tr.dataset.bag || '0') || 0;
     const transfers = parseFloat(totalTd.dataset.transfers || '0') || 0;
-    const air = include ? base + bag : base;
-    const total = base + (include ? bag : 0) + transfers;
-    const span = fareTd.querySelector('span[data-eur]');
-    if (span) span.dataset.eur = air.toFixed(0);
-    fareTd.dataset.sortNumber = air.toFixed(2);
+    const air = base + (includeBags ? bag : 0);
+    const total = air + (includeTransfers ? transfers : 0);
+    const fareSpan = fareTd.querySelector('span[data-eur]');
+    if (fareSpan) {
+      fareSpan.dataset.eur = air.toFixed(0);
+      fareTd.dataset.sortNumber = air.toFixed(2);
+    }
+    const totalSpan = totalTd.querySelector('span[data-eur]');
+    if (totalSpan) totalSpan.dataset.eur = total.toFixed(0);
     tr.dataset.eurTotal = total.toFixed(2);
-    totalTd.dataset.eur = total.toFixed(0);
     totalTd.dataset.sortNumber = total.toFixed(2);
   });
   apply();
 }
-document.getElementById('filter-bags').addEventListener('change', e => setBags(e.target.checked));
+document.getElementById('filter-bags').addEventListener('change', recalc);
+document.getElementById('filter-transfers').addEventListener('change', recalc);
 document.getElementById('filter-origin').addEventListener('change', applyFilters);
 document.getElementById('filter-source').addEventListener('change', applyFilters);
 document.getElementById('filter-days-min').addEventListener('input', applyFilters);
@@ -775,15 +788,18 @@ function showDetails(it) {
       : `<span class="delta-chip up">▲ ${fmt(diff).trim()} more</span>`;
   }
   const bagOff = !includeBags && (it.bag_fee_pp || 0) > 0;
+  const trOff = !includeTransfers && (it.transfers || 0) > 0;
   const bagLines = (it.bag_items || []).map(([n, v]) => [esc(n), fmt(v)]);
   const rows = [
     ...(it.ota_base_fare != null
       ? [['OTA base fare', fmt(it.ota_base_fare)]]
       : [['Airfare (base fare)', fmt(it.fare_base != null ? it.fare_base : it.airfare)]]),
     ...(bagOff ? [['Bag fees (excluded by toggle)', '—']] : bagLines),
-    ...it.transfer_items.map(([n, v]) => [esc(n), fmt(v)]),
+    ...(trOff ? [['Transfers (excluded by toggle)', '—']]
+              : it.transfer_items.map(([n, v]) => [esc(n), fmt(v)])),
   ];
-  const grand = bagOff ? it.total - it.bag_fee_pp : it.total;
+  const grand = it.total - (bagOff ? it.bag_fee_pp || 0 : 0)
+                          - (trOff ? it.transfers || 0 : 0);
   const costs = rows.map(([n, v]) =>
     `<tr><td>${n}</td><td>${v}</td></tr>`).join('');
   const links = it.gf_links

@@ -169,8 +169,11 @@ Other validation errors (e.g. ReturnValidationError) still count as failures.
   fee-charging carriers (accurate for self-transfers, conservative for through-tickets).
   Row fields: `fare_base`, `bag_fee_pp` (per person), `bag_items` (dialog itemization),
   `bag_included` (True when nothing is charged). GF RT rows with unknown return
-  carriers mirror the outbound's policy. The Bag fees toggle rewrites ALL rows'
-  airfare/total to the base fare (not just SS).
+  carriers mirror the outbound's policy. The Bag fees and Transfers toggles rewrite
+  ALL rows' prices client-side (base fare ± bag fees ± transfer estimates) —
+  `recalc()` in the template recomputes every row from
+  `fare_base`/`data-bag`/`data-transfers` and re-sorts; the detail dialog follows
+  both toggles.
 - Sort by total = airfare + transfers.
 - RT rows return to their European origin; VIE RT therefore incurs two FlixBus legs.
 - Itinerary keys are asserted unique. OJ generation is independent of the RT
@@ -323,19 +326,23 @@ known duration always pass. Summary cards are computed from the UNFILTERED
 ranking (they can disagree with the first visible row when filters hide rows).
 Rendering keeps the top `top_n` rows per
 `(departure city, trip days)` bucket, then the browser displays at most `top_n`
-matching rows under the active filters and sort order. Mobile (≤720px): the ranking table renders as stacked cards via CSS only — the
-thead is hidden and each row becomes a 2-column grid card showing only what
-matters: badge (+agent) top-left, rank + big bold total top-right, route
-(semibold), departure → return dates with a CSS-generated arrow, both legs
-(the ONLY cells that keep tiny uppercase captions), a cost line (fare+bag
-breakdown left, transfers right, both small/muted), and booking links as a
-full-width pill row. Captions on all other cells are suppressed; the airlines
-line inside legs and the italic reference note are hidden on mobile (the detail
-dialog shows them). The Days cell is hidden. Selectors are scoped to `#tbl` so
-the dialog's cost table is untouched, and the DOM order is unchanged so
-sorting, filters, the bag toggle, and the dialog keep working (the JS reads
-`tr.children` indexes, not layout). The detail dialog becomes a bottom sheet
-with full-width booking links.
+matching rows under the active filters and sort order. Mobile (≤720px): the ranking
+table renders as stacked cards via CSS only — the thead is hidden and each row becomes
+a 2-column grid card showing only what matters: badge (+agent) top-left, big bold
+total top-right with a tiny muted caption stating what it includes ("incl bag +
+transfer fees" / "incl bag fees" / "incl transfer fees" / "base fare", driven by
+`no-bags`/`no-transfers` classes on `#tbl` set from the two checkboxes), route
+(semibold), departure → return dates meeting mid-card with a CSS arrow (no year —
+the window never crosses years, `fmt_date` is `%a %d %b`), both legs (the ONLY cells
+that keep tiny uppercase captions), and booking links as a full-width pill row.
+Hidden on mobile: rank (useless on cards), fare+bag breakdown, transfers value, Days
+cell, all other captions, airlines line inside legs, italic reference note (the
+detail dialog shows all of these). Selectors are scoped to `#tbl` so the dialog's
+cost table is untouched, and the DOM order is unchanged so sorting, filters, the
+toggles, and the dialog keep working (the JS reads `tr.children` indexes, not
+layout). The detail dialog becomes a bottom sheet with full-width booking links;
+its grand total follows both toggles (excluded items shown as "excluded by
+toggle" lines).
 Summary cards: cheapest overall / round trip / open jaw / OTA (Skyscanner).
 Charts (Chart.js CDN): per-itinerary totals over runs (top history_top_n), cheapest
 overall per run.
@@ -452,7 +459,7 @@ OTA self-transfer combos — that gap is Skyscanner's value-add.
 - Exact per-airline bag fees (replacing the flat 120/person estimate): implemented
   2026-09 — BAG_POLICY table + bag_fees_for_legs, applied to ALL row kinds (Google
   prices verified identical with checked_bags 0/1, so fares are base fares everywhere);
-  bag itemization in the dialog; Bag fees toggle applies to every row.
+  bag itemization in the dialog; Bag fees + Transfers toggles apply to every row.
 - Merged single ranking table with per-row multi-source links: implemented.
 - Skyscanner true multi-city open-jaw searches (OJ universe + tier, fast-path multi-leg
   payload, OJ ranking/badge/multicity link): implemented and CI-VALIDATED (2026-09-17:

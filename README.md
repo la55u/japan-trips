@@ -34,7 +34,8 @@ shared between the two travellers + 1 carry-on per person**, charged per directi
 from each airline's published online rates (e.g. Scoot €45, Finnair Light €75,
 Lufthansa-group Light €70 per direction; full-service Asian carriers include both
 bags). The detail dialog itemizes the fees per airline and direction; the *Bag fees*
-toggle compares raw fares. OTA rows are ranked independently of Google.
+and *Transfers* toggles compare raw fares and fares without transfer estimates. OTA rows
+are ranked independently of Google.
 
 Skyscanner is spot-checked through an anti-fingerprint browser at most every 2 hours in
 three tiers with per-combination refresh times: **hot** (refresh current winners),
@@ -95,10 +96,13 @@ push promptly (the DB is a binary file and cannot merge).
 - Summary cards (top of page, compact): cheapest overall / round trip / open jaw / OTA
   (Skyscanner).
 - Filters sit directly above the table: EUR/HUF toggle, departure-city selector, source
-  filter (Google / OTA), max single-leg duration (default 24 h — raise it to surface
-  cheap-but-slow OTA itineraries), and minimum/maximum trip-day range. Top-40 rows,
-  sortable by any column (▲/▼ indicator); the report retains enough candidates to show
-  the best 40 for every configured city/day combination.
+   filter (Google / OTA), max single-leg duration (default 24 h — raise it to surface
+   cheap-but-slow OTA itineraries), a Bag fees checkbox, a Transfers checkbox
+   (estimates for shinkansen/domestic flight/FlixBus — untick to compare bare fares),
+   and minimum/maximum trip-day range. Toggling fees/transfer costs rewrites every
+   row's price live (the mobile cards caption what the big price includes). Top-40 rows,
+   sortable by any column (▲/▼ indicator); the report retains enough candidates to show
+   the best 40 for every configured city/day combination.
 - Legs show route (hover airport codes for full names), local departure/arrival times,
   `(+n)` = arrival n days after departure, total duration in hours incl. layovers, stops,
   airlines, and Google Flights links to verify/book.
