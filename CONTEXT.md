@@ -323,12 +323,19 @@ known duration always pass. Summary cards are computed from the UNFILTERED
 ranking (they can disagree with the first visible row when filters hide rows).
 Rendering keeps the top `top_n` rows per
 `(departure city, trip days)` bucket, then the browser displays at most `top_n`
-matching rows under the active filters and sort order. Mobile (≤720px): the ranking
-table renders as stacked cards via CSS only (cells get `data-label`s used as ::before
-captions; the thead is hidden, Days column hidden) — selectors are scoped to `#tbl`
-so the dialog's cost table is untouched, and the DOM order is unchanged so sorting,
-filters, the bag toggle, and the dialog keep working; the detail dialog becomes a
-bottom sheet with full-width booking links.
+matching rows under the active filters and sort order. Mobile (≤720px): the ranking table renders as stacked cards via CSS only — the
+thead is hidden and each row becomes a 2-column grid card showing only what
+matters: badge (+agent) top-left, rank + big bold total top-right, route
+(semibold), departure → return dates with a CSS-generated arrow, both legs
+(the ONLY cells that keep tiny uppercase captions), a cost line (fare+bag
+breakdown left, transfers right, both small/muted), and booking links as a
+full-width pill row. Captions on all other cells are suppressed; the airlines
+line inside legs and the italic reference note are hidden on mobile (the detail
+dialog shows them). The Days cell is hidden. Selectors are scoped to `#tbl` so
+the dialog's cost table is untouched, and the DOM order is unchanged so
+sorting, filters, the bag toggle, and the dialog keep working (the JS reads
+`tr.children` indexes, not layout). The detail dialog becomes a bottom sheet
+with full-width booking links.
 Summary cards: cheapest overall / round trip / open jaw / OTA (Skyscanner).
 Charts (Chart.js CDN): per-itinerary totals over runs (top history_top_n), cheapest
 overall per run.
