@@ -25,7 +25,9 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          pip install -e . --no-deps
 
       - name: Fetch camoufox browser
         run: python -m camoufox fetch
@@ -51,7 +53,7 @@ jobs:
           exit 1
 
       - name: Scan next batch of stale queries
-        run: python flight_search.py --limit 450 --db flights.db --out index.html
+        run: python -m japan_trips --limit 450 --db flights.db --out index.html
 
       - name: Commit updated results and cache
         run: |

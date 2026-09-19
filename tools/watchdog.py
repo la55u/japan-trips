@@ -10,14 +10,14 @@ import os
 import shutil
 import subprocess
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 ACTIVE_STATUSES = {"in_progress", "pending", "queued", "requested", "waiting"}
 
 
 def parse_timestamp(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return datetime.fromisoformat(value)
 
 
 def evaluate_runs(
@@ -111,7 +111,7 @@ def exclusive_lock(path: Path):
 
 
 def log(message: str):
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     print(f"{timestamp} {message}", flush=True)
 
 
@@ -150,7 +150,7 @@ def main(argv: list[str] | None = None) -> int:
         runs = load_runs(gh_bin, args.repo, args.workflow)
         action, reason = evaluate_runs(
             runs,
-            datetime.now(timezone.utc),
+            datetime.now(UTC),
             timedelta(minutes=args.max_age_minutes),
             timedelta(minutes=args.retry_cooldown_minutes),
         )

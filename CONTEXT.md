@@ -17,13 +17,40 @@ MUST be updated whenever behavior, schema, config, or pipeline changes.**
 
 ## Repository layout
 
-- `flight_search.py` — the entire pipeline in one file.
-- `test_flight_search.py` — stdlib unittest regression suite.
+- `src/japan_trips/` — the scanner package (installed editable; see Environment):
+  - `config.py` — constants (SOCS cookie, CITIES, CACHE_VERSION), CLI args,
+    config loading, `now_iso`/`_age_hours` helpers, logging setup.
+  - `db.py` — SQLite schema creation + column migrations (`init_db`).
+  - `google.py` — Google Flights pipeline: query building (fast_flights protobuf
+    builder), page fetch, ds:1 payload parsing, RPC replays (GetShoppingResults,
+    Select-flight), validation/normalization, `run_scan`, cache key builder
+    (`key_of`), `plan_queries`, `RequestGate`, rate/cooldown control.
+  - `skyscanner.py` — OTA spot-checks: camoufox browser session, fast in-page
+    API path + SPA slow path, PX solving, tiered scheduler
+    (`run_skyscanner_if_due`), universes, Travelpayouts boost.
+  - `bags.py` — `BAG_POLICY` + `bag_fees_for_legs` (exact per-airline fees).
+  - `ranking.py` — `transfers_for`, cache/skyscanner row loading, `_ss_itineraries`
+    synthesis, `build_itineraries`, `prev_totals`, `label_itins`.
+  - `render.py` — `render_html`, `TEMPLATE` (the whole HTML/JS page),
+    `refresh_html`, stylesheet link is `assets/results.css`.
+  - `cli.py` / `__main__.py` — `python -m japan_trips` entry point (`main`).
+  - `__init__.py` — re-export facade exposing the old single-file module's names
+    (tests do `import japan_trips as fs`).
+- `tests/test_flight_search.py`, `tests/test_watchdog.py` — regression suites.
+  Mock targets use real module paths, e.g. `patch("japan_trips.google.fetch_html")`,
+  `patch("japan_trips.skyscanner.skyscanner_spotcheck")`, and
+  `japan_trips.google.time.sleep` (module of the CALLER, not the facade).
+- `tools/watchdog.py` — stdlib-only watchdog (systemd user timer invokes it via
+  absolute path `/usr/bin/python3 .../tools/watchdog.py`).
 - `config.toml` — all knobs (window, costs, TTL, cadence, skyscanner settings).
+  Default `--config` is `<repo>/config.toml` via `BASE` in config.py.
 - `flights.db` — CI-owned SQLite (committed). Local runs use `flights_local.db`.
 - `index.html` — generated report, deployed to GitHub Pages (CI-owned).
-- `results.css` — static stylesheet linked by index.html (must be committed;
+- `assets/results.css` — static stylesheet linked by index.html (must be committed;
   local `--out` runs into another directory won't style the page).
+- `pyproject.toml` — packaging (src layout, setuptools) + Ruff config. Ruff target
+  derives from `requires-python = ">=3.11"`, which enables version-gated rules
+  (UP017 datetime.UTC, FURB162) — CI enforces them; do not regress.
 - GitHub Pages has no root redirect page: the canonical URL is
   https://la55u.github.io/japan-trips/ (index.html is the only HTML
   file in the repo).
@@ -35,7 +62,12 @@ MUST be updated whenever behavior, schema, config, or pipeline changes.**
 
 - Python 3.14 venv at `./venv` (NOTE: venv bin scripts may retain a stale shebang after
   a repository rename; always invoke via
-  `./venv/bin/python -m pip ...` or `./venv/bin/python script.py`).
+  `./venv/bin/python -m pip ...` or `./venv/bin/python -m japan_trips`).
+- The package must be installed editable into whatever interpreter runs it:
+  `./venv/bin/python -m pip install -e . --no-deps` (after `pip install -r
+  requirements.txt`). CI does the same in both workflows.
+- `BASE` in config.py = repo root via `parents[2]` — valid only for the editable
+  install; `--config` and `--out` defaults are repo-relative.
 - The repository directory was previously renamed; do not rely on venv script shebangs.
 - GitHub: repo `la55u/japan-trips`, Pages at
   https://la55u.github.io/japan-trips/index.html (branch `main`, root).
@@ -129,7 +161,7 @@ Other validation errors (e.g. ReturnValidationError) still count as failures.
   `checked_bags` query param at 0 or 1 (the param only filters availability; keep it
   at 1 to prefer bag-compatible itineraries). `bag_fees_for_legs` adds the cost of
   1 checked bag SHARED between the travellers + 1 carry-on per person, per direction
-  (outbound/return), from `BAG_POLICY` in flight_search.py (published online/prepaid
+  (outbound/return), from `BAG_POLICY` in bags.py (published online/prepaid
   rates, checked 2026-09): Scoot 45, Wizz 35+15 cabin pp, Cebu 30, Jeju 42, Eastar 21,
   Jetstar 25, Lufthansa/Austrian/SWISS/Brussels 70 (Light), Finnair 75 (Light), BA 70
   (Basic), Condor 60+30 cabin pp (Zero); unknown carriers and all other airlines are
@@ -258,8 +290,8 @@ Route/legs/dates, stop, and duration limits are still validated per deal. Exact
 
 ## HTML page (index.html)
 
-Template string `TEMPLATE` in flight_search.py, placeholders `__*__` replaced in
-render_html. Styles live in the static `results.css` (linked via `<link>`); the page
+Template string `TEMPLATE` in render.py, placeholders `__*__` replaced in
+render_html. Styles live in the static `assets/results.css` (linked via `<link>`); the page
 order: header → compact summary cards → toolbar (EUR/HUF toggle + ALL filters) →
 ranking table → insights (Scan status panel + cheapest-per-route chart) →
 history charts → collapsible foot notes (`<details>`). Single merged ranking
@@ -291,7 +323,12 @@ known duration always pass. Summary cards are computed from the UNFILTERED
 ranking (they can disagree with the first visible row when filters hide rows).
 Rendering keeps the top `top_n` rows per
 `(departure city, trip days)` bucket, then the browser displays at most `top_n`
-matching rows under the active filters and sort order.
+matching rows under the active filters and sort order. Mobile (≤720px): the ranking
+table renders as stacked cards via CSS only (cells get `data-label`s used as ::before
+captions; the thead is hidden, Days column hidden) — selectors are scoped to `#tbl`
+so the dialog's cost table is untouched, and the DOM order is unchanged so sorting,
+filters, the bag toggle, and the dialog keep working; the detail dialog becomes a
+bottom sheet with full-width booking links.
 Summary cards: cheapest overall / round trip / open jaw / OTA (Skyscanner).
 Charts (Chart.js CDN): per-itinerary totals over runs (top history_top_n), cheapest
 overall per run.
@@ -300,21 +337,23 @@ overall per run.
 
 ### verify.yml
 
-Runs Ruff + unittest on push to `main` and on pull requests (setup-python@v7, 3.14,
-pip cache). This is the lint/test gate; it is deliberately separate from the scan so a
-broken commit fails verification without halting the hourly scans — the scan keeps
-running the committed code even while `verify` is red.
+Runs Ruff (`ruff check src tests tools`) + unittest
+(`unittest discover -s tests`) on push to `main` and on pull requests
+(setup-python@v7, 3.14, pip cache; installs requirements + `pip install -e .
+--no-deps`). This is the lint/test gate; it is deliberately separate from the scan
+so a broken commit fails verification without halting the hourly scans — the scan
+keeps running the committed code even while `verify` is red.
 
 ### scan.yml
 
 Hourly at :23 (off-peak — top-of-hour crons get skipped by GitHub's scheduler; observed
 overnight blackout with `0 * * * *`). Steps: checkout@v7 → setup-python@v7 (3.14) →
-pip install → `python -m camoufox fetch` → wait-for-idle
+pip install (requirements + editable package) → `python -m camoufox fetch` → wait-for-idle
 (polls `gh run list` up to 40 min for other in-progress scan runs with startup
 jitter; GitHub's `concurrency: scan` group once failed to serialize a
 watchdog-dispatch + cron overlap and the loser died on a binary `flights.db`
 rebase conflict at the commit step, so this polls as defense in depth) →
-`python flight_search.py --limit 450 --db flights.db --out index.html` → commit
+`python -m japan_trips --limit 450 --db flights.db --out index.html` → commit
 `index.html` + `flights.db`
 as github-actions[bot] with pull --rebase; conflicts fail visibly rather than silently
 discarding a completed scan → push (Pages redeploys automatically).
@@ -328,7 +367,7 @@ gate enforces ~2 HTTP requests/s across workers and real cooldowns block workers
 
 ### Local scheduler watchdog
 
-- `watchdog.py` is a stdlib-only script invoked by a systemd user timer. It calls the
+- `tools/watchdog.py` is a stdlib-only script invoked by a systemd user timer. It calls the
   authenticated `/usr/bin/gh`; it never runs the scanner or writes local flight data.
 - Default policy: check up to 20 recent `scan.yml` runs, dispatch when the latest
   success is older than 75 minutes, skip if any run is active, and suppress another
@@ -338,7 +377,9 @@ gate enforces ~2 HTTP requests/s across workers and real cooldowns block workers
 - Version-controlled units live in `systemd/japan-trips-watchdog.{service,timer}` and
   are linked into the user manager. The timer runs every 10 minutes, uses
   `Persistent=true`, and logs to the user journal. The service sets `HOME` and absolute
-  binary paths so `gh` finds `~/.config/gh/hosts.yml`.
+  binary paths so `gh` finds `~/.config/gh/hosts.yml`, and its `ExecStart` points at
+  `tools/watchdog.py` — after a path change, re-link the service unit
+  (`systemctl --user link --force ...`) + `daemon-reload`.
 - User lingering must be enabled for checks to continue after logout. No local timer
   can execute while the machine is powered off; persistent timers catch up at startup.
 - Permanent machine removal: disable/stop the timer, remove both linked units from
@@ -377,6 +418,13 @@ OTA self-transfer combos — that gap is Skyscanner's value-add.
 
 ## Conventions & gotchas for agents
 
+- Code lives in `src/japan_trips/` (see Repository layout). `japan_trips/__init__.py`
+  is a re-export facade so `import japan_trips as fs` still reaches every name.
+  When `mock.patch`ing, target the module that USES the name:
+  `japan_trips.google.*` (fetch/scan), `japan_trips.skyscanner.*` (spot-checks).
+- The logger is named `japan_trips` (was `flight_search`); `assertLogs` and
+  programmatic log routing must use it. CI log greps are unaffected (the format
+  does not print the logger name).
 - NEVER edit site-packages venv content as a fix; vendor code into the repo instead
   (fast_flights parser was replaced for this reason).
 - `gh run view --log` shows nothing for in-progress runs; download logs only after

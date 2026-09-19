@@ -21,10 +21,12 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          pip install -e . --no-deps
 
       - name: Lint
-        run: python -m ruff check flight_search.py watchdog.py test_flight_search.py test_watchdog.py
+        run: python -m ruff check src tests tools
 
       - name: Test
-        run: python -m unittest -v
+        run: python -m unittest discover -s tests -v

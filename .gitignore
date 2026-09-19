@@ -1,6 +1,10 @@
 venv/
 __pycache__/
 *.pyc
+.ruff_cache/
+*.egg-info/
+build/
+dist/
 flights_local.db
 index_local.html
 .env

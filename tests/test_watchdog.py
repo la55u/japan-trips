@@ -1,9 +1,13 @@
+import sys
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
 import watchdog
 
-NOW = datetime(2026, 9, 13, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 9, 13, 12, 0, tzinfo=UTC)
 
 
 def run(*, status="completed", conclusion="success", created_minutes=30, age_minutes=5):

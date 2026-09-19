@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "japan-trips"
+version = "1.0.0"
+description = "Flight deal scanner for BUD/VIE -> Tokyo/Osaka with a static HTML report"
+requires-python = ">=3.11"
+dependencies = [
+    "fast-flights==3.1.0",
+    "primp==2.0.0",
+    "selectolax==0.4.11",
+    "typing_extensions==4.16.0",
+    "camoufox[geoip]==0.5.6",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+extend-select = ["I"]

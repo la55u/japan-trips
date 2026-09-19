@@ -2,11 +2,11 @@ import json
 import sqlite3
 import unittest
 from copy import deepcopy
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import flight_search as fs
+import japan_trips as fs
 
 
 def config():
@@ -194,8 +194,8 @@ class RankingTests(unittest.TestCase):
 
 
 class FailureTests(unittest.TestCase):
-    @patch("flight_search.time.sleep")
-    @patch("flight_search.fetch_html", side_effect=OSError("network down"))
+    @patch("japan_trips.google.time.sleep")
+    @patch("japan_trips.google.fetch_html", side_effect=OSError("network down"))
     def test_transport_errors_are_retried_and_returned(self, fetch, _sleep):
         itins, error, suggestions, client, page = fs.fetch_with_retry(None)
         self.assertIsNone(itins)
@@ -206,7 +206,7 @@ class FailureTests(unittest.TestCase):
         self.assertIsNone(page)
 
     @patch(
-        "flight_search.fetch_with_retry",
+        "japan_trips.google.fetch_with_retry",
         return_value=(None, "OSError: temporary", [], None, None),
     )
     def test_failed_refresh_retains_last_good_price(self, _fetch):
@@ -249,7 +249,7 @@ class FailureTests(unittest.TestCase):
         self.assertIn("temporary", row[3])
 
     @patch(
-        "flight_search.fetch_with_retry",
+        "japan_trips.google.fetch_with_retry",
         return_value=(None, "OSError: persistent", [], None, None),
     )
     def test_failed_query_does_not_starve_unseen_queries(self, _fetch):
@@ -267,8 +267,8 @@ class FailureTests(unittest.TestCase):
             conn.execute("SELECT COUNT(*) FROM price_cache").fetchone()[0], 2
         )
 
-    @patch("flight_search.fetch_return_legs")
-    @patch("flight_search.fetch_with_retry")
+    @patch("japan_trips.google.fetch_return_legs")
+    @patch("japan_trips.google.fetch_with_retry")
     def test_invalid_return_is_not_recorded_as_success(self, fetch, returns):
         cfg = config()
         cfg["search"]["origins"] = ["BUD"]
@@ -293,8 +293,8 @@ class FailureTests(unittest.TestCase):
             conn.execute("SELECT COUNT(*) FROM price_history").fetchone()[0], 0
         )
 
-    @patch("flight_search.fetch_return_legs")
-    @patch("flight_search.fetch_with_retry")
+    @patch("japan_trips.google.fetch_return_legs")
+    @patch("japan_trips.google.fetch_with_retry")
     def test_next_outbound_is_used_when_cheapest_return_is_invalid(
         self, fetch, returns
     ):
@@ -343,7 +343,7 @@ class SkyscannerTests(unittest.TestCase):
 
     def test_identity_is_stable_across_price_changes(self):
         cfg = config()
-        fetched = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fetched = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         deal = {
             "price_raw": 300000,
             "price_fmt": "300 000 Ft",
@@ -387,7 +387,7 @@ class SkyscannerTests(unittest.TestCase):
 
     def test_over_stop_limit_is_excluded(self):
         cfg = config()
-        fetched = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fetched = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         deal = {
             "eur": 300,
             "agents": ["Agent"],
@@ -401,7 +401,7 @@ class SkyscannerTests(unittest.TestCase):
 
     def test_invalid_deals_are_skipped_before_accepting_eligible_ones(self):
         cfg = config()
-        fetched = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fetched = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         invalid = {
             "eur": 200,
             "agents": ["Invalid"],
@@ -433,7 +433,7 @@ class SkyscannerTests(unittest.TestCase):
 
     def test_deal_without_google_match_is_still_ranked(self):
         cfg = config()
-        fetched = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fetched = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         deal = {
             "eur": 300,
             "agents": ["Agent"],
@@ -464,7 +464,7 @@ class SkyscannerTests(unittest.TestCase):
 
     def test_up_to_five_unique_deals_per_pair_are_accepted(self):
         cfg = config()
-        fetched = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fetched = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         deals = []
         for i in range(6):
             deals.append(
@@ -518,7 +518,7 @@ class SkyscannerTests(unittest.TestCase):
             ],
         }
         # ~96h old -> inside the indicative window (24h < age <= max_age 168h)
-        fetched = (datetime.now(timezone.utc) - timedelta(hours=96)).strftime(
+        fetched = (datetime.now(UTC) - timedelta(hours=96)).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         )
         row = ss_row(json.dumps([deal]), fetched)
@@ -527,7 +527,7 @@ class SkyscannerTests(unittest.TestCase):
         self.assertTrue(result[0]["indicative"])
 
         # older than max_age_hours -> dropped
-        expired = (datetime.now(timezone.utc) - timedelta(hours=200)).strftime(
+        expired = (datetime.now(UTC) - timedelta(hours=200)).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         )
         expired_row = ss_row(json.dumps([deal]), expired)
@@ -535,7 +535,7 @@ class SkyscannerTests(unittest.TestCase):
 
     def test_deal_cheaper_than_google_is_not_required_anymore(self):
         cfg = config()
-        fetched = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fetched = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         deal = {
             "eur": 600,
             "agents": ["Agent"],
@@ -585,7 +585,7 @@ class SkyscannerTests(unittest.TestCase):
         }
         return ss_row(
             json.dumps([deal]),
-            datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         )
 
     def test_ota_deals_over_google_leg_cap_kept_up_to_display_cap(self):
@@ -627,7 +627,7 @@ class SkyscannerTests(unittest.TestCase):
 
     def test_wrong_route_or_date_is_excluded(self):
         cfg = config()
-        fetched = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fetched = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         deal = {
             "eur": 300,
             "agents": ["Agent"],
@@ -652,7 +652,7 @@ class SkyscannerTests(unittest.TestCase):
 
     def test_duplicate_deals_do_not_hide_next_unique_deal(self):
         cfg = config()
-        fetched = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fetched = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         first = {
             "eur": 300,
             "agents": ["First"],
@@ -683,7 +683,7 @@ class SkyscannerTests(unittest.TestCase):
 
     def test_open_jaw_deal_is_ranked_as_oj(self):
         cfg = config()
-        fetched = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fetched = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         deal = {
             "eur": 400,
             "agents": ["Agent"],
@@ -728,7 +728,7 @@ class SkyscannerTests(unittest.TestCase):
 
     def test_open_jaw_wrong_return_city_is_excluded(self):
         cfg = config()
-        fetched = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fetched = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         deal = {
             "eur": 400,
             "agents": ["Agent"],
@@ -851,8 +851,8 @@ class SchedulerTests(unittest.TestCase):
             ],
         }
 
-    @patch("flight_search._travelpayouts_cheap_pairs", return_value={})
-    @patch("flight_search.skyscanner_spotcheck")
+    @patch("japan_trips.skyscanner._travelpayouts_cheap_pairs", return_value={})
+    @patch("japan_trips.skyscanner.skyscanner_spotcheck")
     def test_tiered_selection_and_persistence(self, spotcheck, _tp):
         cfg = self._cfg()
         conn = fs.init_db(":memory:")
@@ -902,15 +902,15 @@ class SchedulerTests(unittest.TestCase):
             ).fetchone()
         )
 
-    @patch("flight_search._travelpayouts_cheap_pairs", return_value={})
-    @patch("flight_search.skyscanner_spotcheck")
+    @patch("japan_trips.skyscanner._travelpayouts_cheap_pairs", return_value={})
+    @patch("japan_trips.skyscanner.skyscanner_spotcheck")
     def test_recent_run_blocks_rescan(self, spotcheck, _tp):
         cfg = self._cfg()
         conn = fs.init_db(":memory:")
         self.addCleanup(conn.close)
         conn.execute(
             "INSERT INTO state (key, value) VALUES ('skyscanner_last_run_v2_2', ?)",
-            (datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),),
+            (datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),),
         )
         args = SimpleNamespace(rank_only=False, no_skyscanner=False)
 
@@ -918,8 +918,8 @@ class SchedulerTests(unittest.TestCase):
 
         spotcheck.assert_not_called()
 
-    @patch("flight_search._travelpayouts_cheap_pairs", return_value={})
-    @patch("flight_search.skyscanner_spotcheck")
+    @patch("japan_trips.skyscanner._travelpayouts_cheap_pairs", return_value={})
+    @patch("japan_trips.skyscanner.skyscanner_spotcheck")
     def test_oj_exploration_quota_and_persistence(self, spotcheck, _tp):
         cfg = self._cfg()
         cfg["skyscanner"]["oj_enabled"] = True
@@ -969,8 +969,8 @@ class SchedulerTests(unittest.TestCase):
         for (k,) in oj_rows:
             self.assertEqual(len(k.split("|")), 8)
 
-    @patch("flight_search._travelpayouts_cheap_pairs", return_value={})
-    @patch("flight_search.skyscanner_spotcheck")
+    @patch("japan_trips.skyscanner._travelpayouts_cheap_pairs", return_value={})
+    @patch("japan_trips.skyscanner.skyscanner_spotcheck")
     def test_neighbour_tier_shifts_tagged_rt_combos(self, spotcheck, _tp):
         cfg = self._cfg()
         cfg["skyscanner"]["hot_combos"] = 0
@@ -1038,7 +1038,7 @@ class TooLongTests(unittest.TestCase):
         it["legs"] = [{"from": "BUD", "to": "HND", "date": "2027-03-22"}]
         return it
 
-    @patch("flight_search.fetch_with_retry")
+    @patch("japan_trips.google.fetch_with_retry")
     def test_too_long_result_is_recorded_as_confirmed(self, fetch):
         cfg = config()
         cfg["search"]["origins"] = ["BUD"]
@@ -1092,9 +1092,9 @@ class ParserTests(unittest.TestCase):
 
 class RenderTests(unittest.TestCase):
     def test_stylesheet_is_external(self):
-        self.assertIn('<link rel="stylesheet" href="results.css">', fs.TEMPLATE)
+        self.assertIn('<link rel="stylesheet" href="assets/results.css">', fs.TEMPLATE)
         self.assertNotIn("<style>", fs.TEMPLATE)
-        with open("results.css") as f:
+        with open("assets/results.css") as f:
             self.assertIn(".cards", f.read())
 
     def test_table_filters_and_per_bucket_candidates_are_rendered(self):
@@ -1153,7 +1153,7 @@ class RenderTests(unittest.TestCase):
             "currency": "HUF",
         }
         # ~60h old -> inside the indicative window (24h < age <= max_age 168h)
-        fetched = (datetime.now(timezone.utc) - timedelta(hours=60)).strftime(
+        fetched = (datetime.now(UTC) - timedelta(hours=60)).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         )
         deal = {
@@ -1244,14 +1244,14 @@ class DatabaseTests(unittest.TestCase):
                 "2027-04-03",
                 1,
                 "not-json",
-                datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 2,
                 "HUF",
             ),
         )
         rows = {("RT", "BUD", "TYO", "2027-03-22", "2027-04-03"): detail("BUD -> HND")}
 
-        with self.assertLogs("flight_search", level="ERROR"):
+        with self.assertLogs("japan_trips", level="ERROR"):
             result = fs.build_with_optional_skyscanner(cfg, conn, rows)
 
         self.assertEqual(len(result), 1)

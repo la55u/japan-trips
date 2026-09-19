@@ -54,16 +54,17 @@ ranked.
 ```bash
 python3 -m venv venv
 ./venv/bin/python -m pip install -r requirements.txt
+./venv/bin/python -m pip install -e . --no-deps
 ./venv/bin/python -m camoufox fetch
 ```
 
 ## Usage
 
 ```bash
-./venv/bin/python flight_search.py              # full scan into flights_local.db + index_local.html
-./venv/bin/python flight_search.py --limit 50   # partial run (first 50 stale queries)
-./venv/bin/python flight_search.py --rank-only  # rebuild ranking + HTML from local cache
-./venv/bin/python flight_search.py --force      # ignore cache TTL, refetch everything
+./venv/bin/python -m japan_trips              # full scan into flights_local.db + index_local.html
+./venv/bin/python -m japan_trips --limit 50   # partial run (first 50 stale queries)
+./venv/bin/python -m japan_trips --rank-only  # rebuild ranking + HTML from local cache
+./venv/bin/python -m japan_trips --force      # ignore cache TTL, refetch everything
 ```
 
 Useful flags: `--workers N`, `--step N` (scan every Nth day), `--top N`, `--db FILE`,
@@ -89,7 +90,7 @@ push promptly (the DB is a binary file and cannot merge).
 
 ## Output (`index.html`)
 
-- Files: `index.html` (generated) + `results.css` (static styles, committed) —
+- Files: `index.html` (generated) + `assets/results.css` (static styles, committed) —
   the only HTML file on the site.
 - Summary cards (top of page, compact): cheapest overall / round trip / open jaw / OTA
   (Skyscanner).
@@ -127,7 +128,8 @@ TTL; parser, transport, and unrecognized-response failures remain due. Fares bey
 - Transfer costs are static estimates (`[costs]`); March–May 2027 shinkansen/domestic
   fares aren't bookable yet.
 - “12–16 days” is a departure-date difference, not guaranteed nights in Japan.
-- Bag fees use published airline online rates (see `BAG_POLICY` in `flight_search.py`),
+- Bag fees use published airline online rates (see `BAG_POLICY` in
+  `src/japan_trips/bags.py`),
   applied per direction; multi-sector mixed-carrier legs charge every unique fee-charging
   carrier once (conservative for through-tickets, accurate for self-transfers). Fare
   families are inferred from the cheapest bookable fare; the exact checkout price and
@@ -150,7 +152,7 @@ Manual runs: *Actions → scan → Run workflow*.
 
 ### Local watchdog
 
-`watchdog.py` compensates for dropped GitHub cron events. It checks the latest workflow
+`tools/watchdog.py` compensates for dropped GitHub cron events. It checks the latest workflow
 runs and dispatches `scan.yml` when the latest success is older than 75 minutes. It
 does nothing while a run is active and waits 30 minutes after any recent attempt before
 retrying, preventing dispatch storms during failures.
@@ -159,7 +161,7 @@ It uses the authenticated GitHub CLI and can be checked without dispatching anyt
 
 ```bash
 gh auth status
-./watchdog.py --dry-run
+./tools/watchdog.py --dry-run
 ```
 
 The repository includes a systemd user service and timer, so no cron package is needed.
@@ -170,6 +172,14 @@ systemctl --user link "$PWD/systemd/japan-trips-watchdog.service"
 systemctl --user link "$PWD/systemd/japan-trips-watchdog.timer"
 systemctl --user daemon-reload
 systemctl --user enable --now japan-trips-watchdog.timer
+```
+
+If the units are already linked from an earlier installation and the watchdog script
+path changed, re-link them (the service `ExecStart` points at `tools/watchdog.py`):
+
+```bash
+systemctl --user link --force "$PWD/systemd/japan-trips-watchdog.service"
+systemctl --user daemon-reload
 ```
 
 Enable user lingering so the timer continues after logout:
@@ -210,7 +220,7 @@ systemctl --user is-enabled japan-trips-watchdog.timer
 ```
 
 Both checks should report `inactive`, `disabled`, or `not-found`. These commands remove
-only the local installation; they intentionally leave `watchdog.py`, its tests, and the
+only the local installation; they intentionally leave `tools/watchdog.py`, its tests, and the
 version-controlled unit files in the repository. Removing the feature from the
 repository as well requires deleting those files, removing them from the CI Ruff
 command, and deleting this documentation. The watchdog does not create a dedicated log
@@ -224,19 +234,26 @@ database or report.
 
 ## Files
 
-- `flight_search.py` — search, ranking, HTML generation (single file).
-- `test_flight_search.py` — ranking, failure-handling, DB, and source regression tests.
-- `watchdog.py`, `test_watchdog.py` — local watchdog and its decision tests.
+- `src/japan_trips/` — the scanner package:
+  - `google.py` — Google Flights fetch/parse pipeline (primary source)
+  - `skyscanner.py` — Skyscanner/OTA spot-checks and tiered scheduler
+  - `ranking.py` — RT/OJ/SS itinerary ranking
+  - `bags.py` — per-airline bag fee policy
+  - `render.py` — HTML report generation
+  - `db.py`, `config.py`, `cli.py` — schema, knobs/CLI, entry point (`python -m japan_trips`)
+- `tests/` — ranking, failure-handling, DB, source, and watchdog regression tests.
+- `tools/watchdog.py` — local watchdog (stdlib-only, run by systemd).
 - `systemd/` — user service and 10-minute timer for the watchdog.
 - `config.toml` — all settings.
 - `flights.db` — CI-owned SQLite cache + price history (committed).
 - `index.html` — generated report deployed via GitHub Pages.
+- `assets/results.css` — static styles for the report.
 - `flights_local.db`, `index_local.html` — local-run outputs (gitignored).
 
 ## GitHub Pages
 
 The report is published at https://la55u.github.io/japan-trips/ (index.html is
-generated directly by the scan; `results.css` carries the styles and is the only
+generated directly by the scan; `assets/results.css` carries the styles and is the only
 other web-served file). The page is refreshed
 automatically by the scheduled workflow; after a deliberate local scan against the
 repo DB, push as described in "Local vs CI data":

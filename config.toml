@@ -10,7 +10,7 @@ max_stops = 2
 # Google Flights query parameter. NOTE: this only filters availability — Google
 # returns identical prices with or without it (verified 2026-09), so bag fees
 # are NOT baked into any fetched fare. Ranking adds exact per-airline fees for
-# 1 shared checked bag + 1 carry-on per person (BAG_POLICY in flight_search.py).
+# 1 shared checked bag + 1 carry-on per person (BAG_POLICY in src/japan_trips/bags.py).
 checked_bags = 1
 adults = 2
 step_days = 1
